@@ -1,0 +1,36 @@
+[package]
+name = "par2-rs"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75.0"
+authors = ["zephleggett"]
+description = "Pure Rust PAR2 file verification and repair library with SIMD optimizations"
+readme = "README.md"
+homepage = "https://github.com/zephleggett/par2-rs"
+repository = "https://github.com/zephleggett/par2-rs"
+license = "MIT OR Apache-2.0"
+keywords = ["par2", "parity", "repair", "verification", "reed-solomon"]
+categories = ["compression", "filesystem"]
+
+[dependencies]
+md5 = "0.7"
+crc32fast = "1.4"
+rayon = "1.10"
+thiserror = "1.0"
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3.20"
+
+[[bin]]
+name = "test_repair"
+path = "test_repair.rs"
+
+[[bin]]
+name = "demo_repair"
+path = "demo_repair.rs"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 16
