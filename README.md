@@ -121,11 +121,48 @@ The streaming architecture constrains memory growth even under high parallelism,
 
 ## Platform Support
 
-ARM64 (Apple Silicon, AWS Graviton): The ARM64 codepath is fully optimized and tested. Galois field arithmetic uses PMULL instructions for polynomial multiplication in GF(2^16). The implementation employs Karatsuba algorithm for 16-bit multiplication and Barrett reduction for modular arithmetic. Measured performance shows 4.6-5.8× speedup compared to scalar operations.
+### ARM64 (Apple Silicon, AWS Graviton)
 
-x86-64: AVX2 and SSSE3 implementations are provided for table-based Galois field multiplication. Expected performance is 8-10× speedup over scalar operations. These codepaths have not been tested on physical hardware. Users requiring x86-64 support should open an issue for testing coordination.
+The ARM64 codepath is fully optimized and tested. Galois field arithmetic uses PMULL instructions for polynomial multiplication in GF(2^16). The implementation employs Karatsuba algorithm for 16-bit multiplication and Barrett reduction for modular arithmetic. Measured performance shows 4.6-5.8× speedup compared to scalar operations.
 
-Other architectures: A portable scalar implementation is available and functions on all platforms.
+**SIMD Feature Ladder**:
+- **PMULL** (preferred): Native polynomial multiplication with Barrett reduction
+  - Processes 16 u16 values (32 bytes) per iteration
+  - 4.6-5.8× speedup over scalar operations
+  - Fully tested on Apple Silicon
+- **Table-based NEON** (fallback): Nibble-based lookup tables with NEON shuffle
+  - Expected 8-10× speedup (currently produces incorrect results, needs fixing)
+- **Scalar fallback**: Portable logarithm table-based multiplication
+
+### x86-64 (Intel, AMD)
+
+The x86-64 implementation provides carryless multiplication (PCLMULQDQ) with runtime feature detection and automatic fallback.
+
+**SIMD Feature Ladder**:
+- **AVX2 PCLMUL** (if available): Carryless multiplication with AVX2 width
+  - Processes 16 u16 values (32 bytes) per iteration
+  - Requires: Intel Haswell (2013+) or AMD Excavator (2015+)
+  - Uses two 128-bit PCLMUL operations per chunk
+  - All tests pass on GitHub Actions x86 runners
+- **SSE PCLMUL** (fallback): Carryless multiplication with SSE width
+  - Processes 8 u16 values (16 bytes) per iteration
+  - Requires: Intel Westmere (2010+) or AMD Jaguar (2013+)
+  - Uses Barrett reduction for GF(2^16) modular arithmetic
+  - All tests pass on GitHub Actions x86 runners
+- **Scalar fallback**: Portable logarithm table-based multiplication
+  - Works on all CPUs
+
+**Future x86 SIMD (planned)**:
+- **VPCLMUL + GFNI** (AVX-512): 512-bit carryless multiplication with affine transformations
+  - Requires: Ice Lake (2019+) or Zen 4 (2022+)
+  - Gated behind `unstable` feature flag
+- **SSSE3 table-based** (for 2006-2010 CPUs): Nibble-based lookup tables
+  - For CPUs with SSSE3 but without PCLMULQDQ
+  - Currently produces incorrect results, needs fixing
+
+### Other Architectures
+
+A portable scalar implementation is available and functions correctly on all platforms.
 
 ## Features
 
@@ -149,13 +186,17 @@ The test suite comprises 104 unit and integration tests covering core functional
 
 Contributions are accepted. The following areas would benefit from additional development:
 
-- x86-64 Testing: The AVX2 and SSSE3 implementations require validation on Intel and AMD hardware. Access to physical x86-64 systems would enable performance verification and correctness testing.
+- **AVX-512 SIMD**: Implement VPCLMUL and GFNI-based Galois field multiplication for Ice Lake+ and Zen 4+ CPUs. Placeholder functions exist under the `unstable` feature flag.
 
-- Command-Line Interface: The repair and create tools provide basic functionality but could be enhanced with improved progress reporting, error diagnostics, and command-line ergonomics.
+- **SSSE3 Table-based SIMD**: Fix the table-based shuffle implementation for 2006-2010 era CPUs without PCLMULQDQ. Currently produces incorrect results.
 
-- Benchmark Coverage: Current benchmarks focus on a single file size and damage pattern. Additional test cases covering diverse file sizes, block counts, and corruption scenarios would provide better performance characterization.
+- **x86-64 Performance Benchmarking**: While PCLMUL implementations pass all tests on GitHub Actions, performance benchmarking on real Intel/AMD hardware would help validate expected speedups.
 
-- Unicode Filenames: The current implementation supports ASCII filenames only. Adding Unicode filename packet support would improve compatibility with international character sets.
+- **Command-Line Interface**: The repair and create tools provide basic functionality but could be enhanced with improved progress reporting, error diagnostics, and command-line ergonomics.
+
+- **Benchmark Coverage**: Current benchmarks focus on a single file size and damage pattern. Additional test cases covering diverse file sizes, block counts, and corruption scenarios would provide better performance characterization.
+
+- **Unicode Filenames**: The current implementation supports ASCII filenames only. Adding Unicode filename packet support would improve compatibility with international character sets.
 
 ## Acknowledgments
 
