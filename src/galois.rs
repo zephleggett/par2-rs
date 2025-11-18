@@ -294,7 +294,6 @@ pub fn gf_mul_slice(scalar: u16, data: &mut [u16]) {
     // Temporarily disabled in favor of scalar fallback
     #[cfg(target_arch = "x86_64")]
     {
-        let _ = (scalar, data); // Suppress unused warning for now
         // if is_x86_feature_detected!("avx2") {
         //     unsafe { gf_mul_slice_avx2(scalar, data) };
         //     return;
@@ -871,7 +870,11 @@ unsafe fn gf_muladd_multi_pclmul_x86(dst: &mut [u16], sources: &[&[u16]], coeffi
 
             // Load 8 u16 values from source
             let mut src_vals: [u16; 8] = [0; 8];
-            std::ptr::copy_nonoverlapping(sources[i].as_ptr().add(offset), src_vals.as_mut_ptr(), 8);
+            std::ptr::copy_nonoverlapping(
+                sources[i].as_ptr().add(offset),
+                src_vals.as_mut_ptr(),
+                8,
+            );
 
             // Multiply and accumulate
             for j in 0..8 {

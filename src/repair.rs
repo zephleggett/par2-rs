@@ -28,8 +28,7 @@ pub fn repair_files_parallel(
     let mut file_block_map: HashMap<FileHash, (usize, usize)> = HashMap::new();
 
     for file_info in &par2_data.files_in_order {
-        let num_blocks =
-            file_info.length.div_ceil(par2_data.block_size) as usize;
+        let num_blocks = file_info.length.div_ceil(par2_data.block_size) as usize;
         file_block_map.insert(file_info.file_id, (total_blocks, num_blocks));
         total_blocks += num_blocks;
     }
