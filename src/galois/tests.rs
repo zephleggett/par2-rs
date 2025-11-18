@@ -178,3 +178,77 @@ fn test_simd_mul_slice_large() {
 
     assert_eq!(data, expected, "SIMD on large array should match scalar");
 }
+
+#[test]
+fn test_simd_feature_detection() {
+    // Print which SIMD features are available for debugging/verification
+    println!("\n=== SIMD Feature Detection ===");
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        println!("Platform: x86-64");
+
+        let has_vpclmulqdq = std::is_x86_feature_detected!("vpclmulqdq");
+        let has_avx512f = std::is_x86_feature_detected!("avx512f");
+        let has_avx512vl = std::is_x86_feature_detected!("avx512vl");
+        let has_gfni = std::is_x86_feature_detected!("gfni");
+        let has_avx2 = std::is_x86_feature_detected!("avx2");
+        let has_pclmulqdq = std::is_x86_feature_detected!("pclmulqdq");
+        let has_sse41 = std::is_x86_feature_detected!("sse4.1");
+        let has_ssse3 = std::is_x86_feature_detected!("ssse3");
+
+        println!("  VPCLMULQDQ: {}", has_vpclmulqdq);
+        println!("  AVX-512F:   {}", has_avx512f);
+        println!("  AVX-512VL:  {}", has_avx512vl);
+        println!("  GFNI:       {}", has_gfni);
+        println!("  AVX2:       {}", has_avx2);
+        println!("  PCLMULQDQ:  {}", has_pclmulqdq);
+        println!("  SSE4.1:     {}", has_sse41);
+        println!("  SSSE3:      {}", has_ssse3);
+
+        // Determine which implementation will be used
+        #[cfg(feature = "unstable")]
+        {
+            if has_vpclmulqdq && has_avx512f && has_avx512vl && has_gfni {
+                println!("  → Using: VPCLMUL + GFNI (AVX-512) [32 u16/iter]");
+            } else if has_vpclmulqdq && has_avx512f && has_avx512vl {
+                println!("  → Using: VPCLMUL (AVX-512) [32 u16/iter]");
+            } else if has_pclmulqdq && has_avx2 && has_sse41 {
+                println!("  → Using: AVX2 PCLMUL [16 u16/iter]");
+            } else if has_pclmulqdq && has_sse41 {
+                println!("  → Using: SSE PCLMUL [8 u16/iter]");
+            } else {
+                println!("  → Using: Scalar fallback [1 u16/iter]");
+            }
+        }
+        #[cfg(not(feature = "unstable"))]
+        {
+            if has_pclmulqdq && has_avx2 && has_sse41 {
+                println!("  → Using: AVX2 PCLMUL [16 u16/iter]");
+            } else if has_pclmulqdq && has_sse41 {
+                println!("  → Using: SSE PCLMUL [8 u16/iter]");
+            } else {
+                println!("  → Using: Scalar fallback [1 u16/iter]");
+            }
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        println!("Platform: ARM64");
+
+        let has_neon = std::arch::is_aarch64_feature_detected!("neon");
+        let has_pmull = std::arch::is_aarch64_feature_detected!("neon");
+
+        println!("  NEON:  {}", has_neon);
+        println!("  PMULL: {} (assumed with NEON crypto)", has_pmull);
+
+        if has_neon {
+            println!("  → Using: PMULL (NEON) [16 u16/iter]");
+        } else {
+            println!("  → Using: Scalar fallback [1 u16/iter]");
+        }
+    }
+
+    println!("==============================\n");
+}

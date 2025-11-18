@@ -44,6 +44,9 @@ jobs:
           path: target
           key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
 
+      - name: Show detected SIMD features
+        run: cargo test --verbose --all-features test_simd_feature_detection -- --nocapture --show-output
+
       - name: Run tests
         run: cargo test --verbose --all-features
 
