@@ -816,38 +816,42 @@ unsafe fn gf_muladd_pclmul_x86(dst: &mut [u16], src: &[u16], scalar: u16) {
         // Combine: mid = mid XOR low XOR high
         let mid = _mm_xor_si128(mid_prod, _mm_xor_si128(low_prod, high_prod));
 
-        // Barrett reduction modulo 0x1100B
-        // Simplified version for now - will optimize later
-        let mut result = _mm_setzero_si128();
+        // Barrett reduction modulo 0x1100B using shift+XOR optimization
+        // Based on par2cmdline-turbo's optimized reduction
 
-        // Extract results and do reduction in scalar (temporary - will optimize)
-        let mut temp_low: [u16; 8] = [0; 8];
-        let mut temp_mid: [u16; 8] = [0; 8];
-        let mut temp_high: [u16; 8] = [0; 8];
+        // For now, combine products: low + mid*256 + high*65536
+        // This creates a 32-bit result that needs reduction to 16 bits
 
-        _mm_storeu_si128(temp_low.as_mut_ptr() as *mut __m128i, low_prod);
-        _mm_storeu_si128(temp_mid.as_mut_ptr() as *mut __m128i, mid);
-        _mm_storeu_si128(temp_high.as_mut_ptr() as *mut __m128i, high_prod);
+        // Interleave low and mid bytes
+        let prod_lo_bytes = _mm_unpacklo_epi8(
+            _mm_and_si128(low_prod, _mm_set1_epi16(0x00FF)),
+            _mm_and_si128(mid, _mm_set1_epi16(0x00FF)),
+        );
+        let prod_hi_bytes = _mm_unpacklo_epi8(
+            _mm_srli_epi16(low_prod, 8),
+            _mm_srli_epi16(mid, 8),
+        );
 
-        let mut reduced: [u16; 8] = [0; 8];
-        for j in 0..8 {
-            // Simplified reduction - extract relevant parts and reduce
-            let l = temp_low[j];
-            let m = temp_mid[j];
-            let h = temp_high[j];
+        // Create 16-bit words: low + (mid << 8)
+        let prod_low16 = _mm_unpacklo_epi8(prod_lo_bytes, prod_hi_bytes);
 
-            // Combine polynomial parts: low + mid*x^8 + high*x^16
-            let mut val = l as u32 | ((m as u32) << 8) | ((h as u32) << 16);
+        // High product contributes at x^16, which is the quotient we need to reduce
+        let quot = _mm_and_si128(high_prod, _mm_set1_epi16(0xFFFF));
 
-            // Reduce modulo 0x1100B using division
-            while val >= 0x10000 {
-                let q = val >> 16;
-                val ^= q * 0x1100B;
-            }
-            reduced[j] = (val & 0xFFFF) as u16;
-        }
+        // Multiply quotient by 0x1111a and take high bits
+        // 0x1111a = (quot ^ (quot >> 4) ^ (quot >> 8) ^ (quot >> 13))
+        let tmp1 = _mm_xor_si128(quot, _mm_srli_epi16(quot, 4));
+        let tmp2 = _mm_xor_si128(tmp1, _mm_srli_epi16(tmp1, 8));
+        let reduced_quot = _mm_xor_si128(tmp2, _mm_srli_epi16(quot, 13));
 
-        result = _mm_loadu_si128(reduced.as_ptr() as *const __m128i);
+        // Multiply by 0x100b and keep low bits
+        // 0x100b = quot ^ (quot << 3) ^ (quot << 1) ^ (quot << 12)
+        let tmp3 = _mm_xor_si128(reduced_quot, _mm_slli_epi16(reduced_quot, 3));
+        let tmp4 = _mm_xor_si128(tmp3, _mm_add_epi16(reduced_quot, reduced_quot)); // << 1
+        let final_quot = _mm_xor_si128(tmp4, _mm_slli_epi16(reduced_quot, 12));
+
+        // Final result: XOR quotient reduction with remainder
+        let result = _mm_xor_si128(final_quot, prod_low16);
 
         // Load destination and XOR with result
         let dst_data = _mm_loadu_si128(dst_ptr.add(offset) as *const __m128i);
