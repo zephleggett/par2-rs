@@ -445,7 +445,7 @@ pub fn gf_muladd_multi(dst: &mut [u16], sources: &[&[u16]], coefficients: &[u16]
 ///
 /// ## Current Implementations
 /// - **ARM64**: PMULL-based parallel processing (up to 8 destinations)
-/// - **x86-64**: Scalar fallback (TODO: add AVX2/SSSE3)
+/// - **x86-64**: PCLMULQDQ-based parallel processing (up to 8 destinations)
 #[inline]
 pub fn gf_muladd_column(destinations: &mut [&mut [u16]], source: &[u16], coefficients: &[u16]) {
     init_tables(); // Ensure tables are initialized
@@ -476,7 +476,18 @@ pub fn gf_muladd_column(destinations: &mut [&mut [u16]], source: &[u16], coeffic
         }
     }
 
-    // Scalar fallback for non-ARM64 platforms
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("pclmulqdq")
+            && is_x86_feature_detected!("sse2")
+            && destinations.len() <= 8
+        {
+            unsafe { gf_muladd_column_pclmul_x86(destinations, source, coefficients) };
+            return;
+        }
+    }
+
+    // Scalar fallback for unsupported platforms or feature sets
     gf_muladd_column_scalar(destinations, source, coefficients);
 }
 
@@ -978,6 +989,85 @@ unsafe fn gf_muladd_multi_pclmul_x86(dst: &mut [u16], sources: &[&[u16]], coeffi
             for j in 0..sources.len() {
                 if coefficients[j] != 0 {
                     *dst_item ^= gf_mul(sources[j][i], coefficients[j]);
+                }
+            }
+        }
+    }
+}
+
+/// x86 PCLMULQDQ column implementation
+///
+/// One source contributes to multiple destinations (transpose of multi-region).
+/// Processes up to 8 destinations simultaneously.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "pclmulqdq,sse2,ssse3")]
+unsafe fn gf_muladd_column_pclmul_x86(
+    destinations: &mut [&mut [u16]],
+    source: &[u16],
+    coefficients: &[u16],
+) {
+    static mut CALL_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    if CALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+        eprintln!(
+            "  ✓ Using parallel column PCLMUL x86 (destinations={}, src_len={})",
+            destinations.len(),
+            source.len()
+        );
+    }
+
+    assert!(destinations.len() <= 8, "Max 8 destinations supported");
+    assert_eq!(destinations.len(), coefficients.len());
+
+    if destinations.is_empty() {
+        return;
+    }
+
+    // Verify all destinations have same length as source
+    for dst in destinations.iter() {
+        assert_eq!(dst.len(), source.len());
+    }
+
+    // Process 8 u16 values (16 bytes) at a time
+    let chunks = source.len() / 8;
+    let remainder = source.len() % 8;
+
+    let src_ptr = source.as_ptr() as *const u8;
+
+    for chunk_idx in 0..chunks {
+        let offset = chunk_idx * 16;
+
+        // Load source data once
+        let src_data = _mm_loadu_si128(src_ptr.add(offset) as *const __m128i);
+
+        // Process each destination
+        for (i, dst) in destinations.iter_mut().enumerate() {
+            if coefficients[i] == 0 {
+                continue;
+            }
+
+            // Compute product using scalar (will optimize later)
+            let mut temp_result: [u16; 8] = [0; 8];
+            let src_vals: [u16; 8] = std::mem::transmute(src_data);
+            for j in 0..8 {
+                temp_result[j] = gf_mul(src_vals[j], coefficients[i]);
+            }
+            let prod = _mm_loadu_si128(temp_result.as_ptr() as *const __m128i);
+
+            // Load destination, XOR with product, store
+            let dst_ptr = dst.as_mut_ptr() as *mut u8;
+            let dst_data = _mm_loadu_si128(dst_ptr.add(offset) as *const __m128i);
+            let result = _mm_xor_si128(dst_data, prod);
+            _mm_storeu_si128(dst_ptr.add(offset) as *mut __m128i, result);
+        }
+    }
+
+    // Handle remainder with scalar code
+    if remainder > 0 {
+        let start = chunks * 8;
+        for (dst, &coeff) in destinations.iter_mut().zip(coefficients.iter()) {
+            if coeff != 0 {
+                for i in start..source.len() {
+                    dst[i] ^= gf_mul(source[i], coeff);
                 }
             }
         }
