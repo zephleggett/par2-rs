@@ -868,7 +868,7 @@ pub(super) unsafe fn gf_muladd_multi_vpclmul_x86(
     let start = chunks * 32;
     if dst.len().min(min_len) - start >= 16 {
         // Use AVX2 for next 16 u16
-        let mut sources_slice: Vec<&[u16]> = sources.iter().map(|s| &s[start..]).collect();
+        let sources_slice: Vec<&[u16]> = sources.iter().map(|s| &s[start..]).collect();
         gf_muladd_multi_avx2_pclmul_x86(&mut dst[start..], &sources_slice, coefficients);
     } else if remainder > 0 {
         let limit = dst.len().min(min_len);

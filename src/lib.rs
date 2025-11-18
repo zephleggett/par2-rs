@@ -1,5 +1,3 @@
-#![cfg_attr(feature = "unstable", feature(stdarch_x86_avx512))]
-
 //! # par2-rs
 //!
 //! A pure Rust implementation of the PAR2 (Parchive 2.0) file verification and repair format.

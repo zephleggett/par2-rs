@@ -61,7 +61,12 @@ use x86::{
 };
 
 #[cfg(all(target_arch = "x86_64", feature = "unstable"))]
-use x86::{gf_mul_slice_vpclmul_x86, gf_mul_slice_vpclmul_gfni_x86};
+use x86::{
+    gf_mul_slice_vpclmul_x86, gf_mul_slice_vpclmul_gfni_x86,
+    gf_muladd_vpclmul_x86,
+    gf_muladd_multi_vpclmul_x86,
+    gf_muladd_column_vpclmul_x86,
+};
 
 #[cfg(target_arch = "aarch64")]
 use arm::{
