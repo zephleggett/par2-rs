@@ -21,7 +21,7 @@ pub fn create_test_file(target_path: &Path, target_size: usize) -> std::io::Resu
     let mut data_files: Vec<PathBuf> = fs::read_dir(data_dir)?
         .filter_map(|e| e.ok())
         .map(|e| e.path())
-        .filter(|p| p.extension().map_or(false, |ext| ext == "data"))
+        .filter(|p| p.extension().is_some_and(|ext| ext == "data"))
         .collect();
     data_files.sort(); // Deterministic order
 
