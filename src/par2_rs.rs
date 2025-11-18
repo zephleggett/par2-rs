@@ -1,315 +1,564 @@
 // PAR2-specific Reed-Solomon implementation using GF(2^16) with polynomial 0x1100B
 // Based on Vandermonde matrix construction as specified in PAR2 spec
 
-use crate::galois::{self, gf_div, gf_mul, gf_pow};
+use crate::galois::{self, gf_mul, gf_muladd_column, gf_pow};
+
+/// Generate PAR2 constants - powers of 2 with special exponents
+/// PAR2 spec: "the first constant is the first power of two that has order 65535"
+/// Valid exponents n satisfy: n%3 != 0 && n%5 != 0 && n%17 != 0 && n%257 != 0
+fn generate_par2_constants(count: usize) -> Vec<u16> {
+    // Per spec: use powers of 2 whose exponent has order 65535
+    // i.e. n % 3 != 0 && n % 5 != 0 && n % 17 != 0 && n % 257 != 0
+    let mut constants = Vec::with_capacity(count);
+    let mut n: u32 = 1; // Start from 1, not 0 (0^n would be invalid)
+    while constants.len() < count {
+        if n % 3 != 0 && n % 5 != 0 && n % 17 != 0 && n % 257 != 0 {
+            constants.push(gf_pow(2, n as usize));
+        }
+        n += 1;
+    }
+    constants
+}
+
+/// Precomputed Gaussian elimination transformation for reconstruction
+/// This is computed once and reused for all chunks to avoid redundant work
+pub struct ReconstructionTransform {
+    pub row_order: Vec<usize>,
+    pub scale_factors: Vec<u16>,
+    pub elimination_factors: Vec<Vec<u16>>,
+    pub vandermonde_coeffs: Vec<Vec<u16>>,
+}
 
 /// PAR2 Reed-Solomon decoder
 pub struct Par2ReedSolomon {
     data_blocks: usize,
-    recovery_blocks: usize,
-    constants: Vec<u16>, // PAR2-specific constants for Vandermonde matrix
-}
-
-/// Generate PAR2 constants: powers of 2 where exponent has order 65535
-/// Exponent e has order 65535 if: e%3 != 0 && e%5 != 0 && e%17 != 0 && e%257 != 0
-fn generate_par2_constants(count: usize) -> Vec<u16> {
-    let mut constants = Vec::with_capacity(count);
-    let mut exponent = 0u32;
-
-    while constants.len() < count && exponent < 65536 {
-        // Check if this exponent has order 65535
-        if exponent % 3 != 0 && exponent % 5 != 0 && exponent % 17 != 0 && exponent % 257 != 0 {
-            // constant = 2^exponent in GF(2^16)
-            let constant = gf_pow(2, exponent as usize);
-            constants.push(constant);
-        }
-        exponent += 1;
-    }
-
-    constants
+    constants: Vec<u16>,
 }
 
 impl Par2ReedSolomon {
     /// Create a new PAR2 Reed-Solomon codec
-    pub fn new(data_blocks: usize, recovery_blocks: usize) -> Self {
+    pub fn new(data_blocks: usize, _recovery_blocks: usize) -> Self {
         galois::init_tables();
         let constants = generate_par2_constants(data_blocks);
+
+        // Debug: Log first few constants to verify they match the spec
+        if data_blocks > 0 {
+            tracing::debug!(
+                constants = ?&constants[0..constants.len().min(10)],
+                "Generated PAR2 constants"
+            );
+        }
+
         Self {
             data_blocks,
-            recovery_blocks,
             constants,
         }
     }
 
-    /// Reconstruct missing data blocks from available data and recovery blocks
+    /// Generate recovery blocks from input data blocks
+    ///
+    /// This is the encoding operation: B = A*X where:
+    /// - A: Matrix of PAR2 constants raised to recovery exponents
+    /// - X: Input data blocks
+    /// - B: Recovery blocks (output)
+    ///
+    /// Much simpler than reconstruction since we're just doing matrix-vector multiplication,
+    /// not solving a linear system.
     ///
     /// # Arguments
-    /// * `blocks` - All blocks (data + recovery), where None indicates missing blocks
-    /// * `recovery_exponents` - Exponents for each recovery block (sorted same as recovery blocks)
-    /// * `block_size` - Size of each block in bytes
+    /// * `data_blocks` - Input data blocks (all must be present)
+    /// * `num_recovery` - Number of recovery blocks to generate
+    /// * `block_size` - Size of each block in bytes (must be multiple of 2)
     ///
     /// # Returns
-    /// Ok(()) if reconstruction successful, Err otherwise
-    pub fn reconstruct(&self, blocks: &mut [Option<Vec<u8>>], recovery_exponents: &[u32], block_size: usize) -> Result<(), String> {
-        let total_blocks = self.data_blocks + self.recovery_blocks;
+    /// Vector of recovery blocks with exponents 0, 1, 2, ... num_recovery-1
+    pub fn encode(
+        &self,
+        data_blocks: &[Vec<u8>],
+        num_recovery: usize,
+        block_size: usize,
+    ) -> Result<Vec<(u32, Vec<u8>)>, String> {
+        use std::time::Instant;
+        let start = Instant::now();
 
-        if blocks.len() != total_blocks {
-            return Err(format!("Expected {} blocks, got {}", total_blocks, blocks.len()));
-        }
-
-        // Count available and missing blocks
-        let mut available_indices = Vec::new();
-        let mut missing_indices = Vec::new();
-
-        for i in 0..self.data_blocks {
-            if blocks[i].is_some() {
-                available_indices.push(i);
-            } else {
-                missing_indices.push(i);
-            }
-        }
-
-        // Add recovery block indices to available
-        for i in self.data_blocks..total_blocks {
-            if blocks[i].is_some() {
-                available_indices.push(i);
-            }
-        }
-
-        if missing_indices.is_empty() {
-            return Ok(()); // Nothing to reconstruct
-        }
-
-        if available_indices.len() < self.data_blocks {
+        if data_blocks.len() != self.data_blocks {
             return Err(format!(
-                "Insufficient blocks: need {}, have {}",
+                "Expected {} data blocks, got {}",
                 self.data_blocks,
-                available_indices.len()
+                data_blocks.len()
             ));
         }
 
-        // Build matrices following par2cmdline's layout:
-        // We need datamissing rows from PRESENT recovery blocks
-
-        let datamissing = missing_indices.len();
-        let datapresent = available_indices.iter().filter(|&&idx| idx < self.data_blocks).count();
-
-        // Separate available blocks into present data and present recovery
-        let present_data_indices: Vec<usize> = available_indices.iter()
-            .filter(|&&idx| idx < self.data_blocks)
-            .copied()
-            .collect();
-        let present_recovery_indices: Vec<usize> = available_indices.iter()
-            .filter(|&&idx| idx >= self.data_blocks)
-            .copied()
-            .collect();
-
-        if present_recovery_indices.len() < datamissing {
-            return Err(format!("Need {} present recovery blocks, have {}",
-                datamissing, present_recovery_indices.len()));
+        if block_size % 2 != 0 {
+            return Err("Block size must be multiple of 2".to_string());
         }
 
-        let incount = datapresent + datamissing;
-        let mut left_matrix = vec![vec![0u16; incount]; datamissing];
-        let mut right_matrix = vec![vec![0u16; datamissing]; datamissing];
-        let mut result_data: Vec<Vec<u16>> = Vec::new();
+        let symbols = block_size / 2;
+        tracing::info!(
+            data_blocks = self.data_blocks,
+            recovery_blocks = num_recovery,
+            block_size,
+            symbols_per_block = symbols,
+            "Encoding PAR2 recovery blocks"
+        );
 
-        // Build first datamissing rows using PRESENT recovery blocks
-        for row in 0..datamissing {
-            let recovery_block_idx = present_recovery_indices[row];
-            let recovery_idx = recovery_block_idx - self.data_blocks;
-            let exponent = recovery_exponents[recovery_idx] as usize;
-
-            // Left matrix columns: present data blocks (Vandermonde) + identity for present recovery
-            // Columns for present data blocks
-            for col in 0..datapresent {
-                let data_idx = present_data_indices[col];
-                left_matrix[row][col] = gf_pow(self.constants[data_idx], exponent);
+        // OPTIMIZATION 1: Pre-convert ALL data blocks to u16 ONCE
+        let convert_start = Instant::now();
+        let mut data_blocks_u16: Vec<Vec<u16>> = Vec::with_capacity(data_blocks.len());
+        for data_block in data_blocks {
+            if data_block.len() != block_size {
+                return Err(format!(
+                    "Data block size mismatch: expected {}, got {}",
+                    block_size,
+                    data_block.len()
+                ));
             }
-            // Identity columns for present recovery blocks being used
-            for col in 0..datamissing {
-                left_matrix[row][datapresent + col] = if row == col { 1 } else { 0 };
+            let u16_data: Vec<u16> = data_block
+                .chunks_exact(2)
+                .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+                .collect();
+            data_blocks_u16.push(u16_data);
+        }
+        tracing::info!(
+            duration_secs = convert_start.elapsed().as_secs_f64(),
+            blocks = data_blocks_u16.len(),
+            "Converted data blocks to u16"
+        );
+
+        // Initialize recovery blocks (all zeros initially)
+        let mut recovery_blocks: Vec<Vec<u16>> = vec![vec![0u16; symbols]; num_recovery];
+
+        // OPTIMIZATION 2 & 3: Column-wise processing
+        // For each data block (column), contribute to ALL recovery blocks
+        let encode_start = Instant::now();
+
+        for (data_idx, data_u16) in data_blocks_u16.iter().enumerate() {
+            // Prepare coefficients for all recovery blocks using repeated multiply
+            let mut coeffs: Vec<u16> = Vec::with_capacity(num_recovery);
+            let base = self.constants[data_idx];
+            let mut coeff = 1u16; // base^0
+            for _ in 0..num_recovery {
+                coeffs.push(coeff);
+                coeff = gf_mul(coeff, base);
             }
 
-            // Right matrix columns: missing data blocks (Vandermonde)
-            for col in 0..datamissing {
-                let missing_data_idx = missing_indices[col];
-                right_matrix[row][col] = gf_pow(self.constants[missing_data_idx], exponent);
-            }
-
-            // Get the actual block data and convert to u16
-            if let Some(ref block_data) = blocks[recovery_block_idx] {
-                let mut row_data = Vec::with_capacity(block_size / 2);
-                for chunk in block_data.chunks_exact(2) {
-                    row_data.push(u16::from_le_bytes([chunk[0], chunk[1]]));
+            // Get mutable references to all recovery blocks
+            let mut recovery_refs: Vec<&mut [u16]> = Vec::with_capacity(num_recovery);
+            for recovery_block in recovery_blocks.iter_mut() {
+                // SAFETY: Each recovery_block is a distinct Vec<u16> allocation.
+                // Converting to raw pointers allows collecting multiple mutable references.
+                // This is safe because:
+                // 1. Each pointer targets non-overlapping memory (different Vec allocations)
+                // 2. Pointers are only used immediately in gf_muladd_column below
+                // 3. No other code accesses recovery_blocks during this operation
+                unsafe {
+                    let ptr = recovery_block.as_mut_ptr();
+                    let len = recovery_block.len();
+                    recovery_refs.push(std::slice::from_raw_parts_mut(ptr, len));
                 }
-                result_data.push(row_data);
-            } else {
-                return Err("Missing recovery block data".to_string());
+            }
+
+            // Apply column-wise multiply-add: recovery[j][i] += data[i] * coeffs[j]
+            gf_muladd_column(&mut recovery_refs, data_u16, &coeffs);
+        }
+
+        tracing::info!(
+            duration_secs = encode_start.elapsed().as_secs_f64(),
+            data_blocks = data_blocks.len(),
+            recovery_blocks = num_recovery,
+            total_ops = data_blocks.len() * num_recovery,
+            "Encoding complete"
+        );
+
+        // Convert recovery blocks back to bytes
+        let mut result: Vec<(u32, Vec<u8>)> = Vec::with_capacity(num_recovery);
+        for (exponent, recovery_u16) in recovery_blocks.into_iter().enumerate() {
+            let mut recovery_bytes = Vec::with_capacity(block_size);
+            for &val in &recovery_u16 {
+                recovery_bytes.extend_from_slice(&val.to_le_bytes());
+            }
+            result.push((exponent as u32, recovery_bytes));
+        }
+
+        tracing::info!(
+            duration_secs = start.elapsed().as_secs_f64(),
+            "Total encoding time"
+        );
+
+        Ok(result)
+    }
+
+    /// Compute Gaussian elimination transformation once for all chunks
+    ///
+    /// This function performs the expensive O(m³) Gaussian elimination setup
+    /// that is independent of chunk data. The result can be reused for all chunks.
+    pub fn compute_reconstruction_transform(
+        &self,
+        missing_indices: &[usize],
+        present_data_indices: &[usize],
+        present_recovery_indices: &[usize],
+        recovery_exponents: &[u32],
+    ) -> Result<ReconstructionTransform, String> {
+        let m = missing_indices.len();
+        if m == 0 {
+            return Err("No missing blocks to reconstruct".into());
+        }
+
+        if present_recovery_indices.len() < m {
+            return Err(format!(
+                "Need {} recovery blocks, have {}",
+                m,
+                present_recovery_indices.len()
+            ));
+        }
+
+        tracing::debug!(
+            missing = m,
+            present_data = present_data_indices.len(),
+            "Computing Gaussian elimination transformation (ONCE for all chunks)"
+        );
+
+        // Build Vandermonde matrix for missing blocks
+        #[allow(non_snake_case)]
+        let mut A: Vec<Vec<u16>> = vec![vec![0u16; m]; m];
+        for (row, &rec_idx) in present_recovery_indices.iter().take(m).enumerate() {
+            let exponent = recovery_exponents[rec_idx - self.data_blocks] as usize;
+            for (col, &miss_idx) in missing_indices.iter().enumerate() {
+                A[row][col] = gf_pow(self.constants[miss_idx], exponent);
             }
         }
 
-        let mut result = result_data;
+        // Track transformation operations for later application
+        let mut row_order: Vec<usize> = (0..m).collect();
+        let mut scale_factors: Vec<u16> = vec![1; m];
+        let mut elimination_factors: Vec<Vec<u16>> = vec![vec![0; m]; m];
 
-        // Solve using augmented Gaussian elimination
-        gauss_elim_augmented(&mut left_matrix, &mut right_matrix, &mut result)?;
-
-        // Debug: Check if right_matrix is identity after solving
-        tracing::info!("After Gaussian elimination:");
-        for row in 0..datamissing.min(3) {
-            let mut right_row = String::new();
-            for col in 0..datamissing.min(3) {
-                right_row.push_str(&format!("{:04x} ", right_matrix[row][col]));
+        // Perform Gaussian elimination to compute transformation
+        for k in 0..m {
+            if A[k][k] == 0 {
+                if let Some(r) = ((k + 1)..m).find(|&r| A[r][k] != 0) {
+                    A.swap(k, r);
+                    row_order.swap(k, r);
+                    scale_factors.swap(k, r);
+                    elimination_factors.swap(k, r);
+                } else {
+                    return Err("Singular matrix".into());
+                }
             }
-            tracing::info!("  right_matrix[{}]: {}", row, right_row);
-        }
 
-        // Debug: Check first few values of left_matrix
-        for row in 0..datamissing.min(3) {
-            let mut left_row = String::new();
-            for col in 0..(datapresent + datamissing).min(5) {
-                left_row.push_str(&format!("{:04x} ", left_matrix[row][col]));
-            }
-            tracing::info!("  left_matrix[{}]: {}", row, left_row);
-        }
-
-        // After Gaussian elimination, result now contains data that when combined with
-        // the leftmatrix coefficients gives us the missing blocks
-        // We need to compute: missing[i] = sum(leftmatrix[i][j] * present_data[j]) + result[i]
-
-        // Actually, after reviewing par2cmdline more carefully, the result vector
-        // after Gaussian elimination should directly contain contributions from the
-        // present recovery blocks. We need to add contributions from present data blocks.
-
-        for (row, &missing_idx) in missing_indices.iter().enumerate() {
-            let mut reconstructed = vec![0u16; block_size / 2];
-
-            // Add contributions from present data blocks
-            for (col, &data_idx) in present_data_indices.iter().enumerate() {
-                let coeff = left_matrix[row][col];
-                if coeff != 0 {
-                    if let Some(ref block_data) = blocks[data_idx] {
-                        for (i, chunk) in block_data.chunks_exact(2).enumerate() {
-                            let data_val = u16::from_le_bytes([chunk[0], chunk[1]]);
-                            let contribution = gf_mul(coeff, data_val);
-                            reconstructed[i] ^= contribution; // XOR is addition in GF(2^n)
-                        }
+            let pivot = A[k][k];
+            scale_factors[k] = pivot;
+            if pivot != 1 {
+                for j in k..m {
+                    if A[k][j] != 0 {
+                        A[k][j] = galois::gf_div(A[k][j], pivot);
                     }
                 }
             }
 
-            // Add the result from Gaussian elimination (contributions from recovery blocks)
-            for (i, &val) in result[row].iter().enumerate() {
-                reconstructed[i] ^= val;
+            for r in 0..m {
+                if r == k {
+                    continue;
+                }
+                let factor = A[r][k];
+                elimination_factors[r][k] = factor;
+                if factor == 0 {
+                    continue;
+                }
+                for j in k..m {
+                    if A[k][j] != 0 {
+                        A[r][j] ^= galois::gf_mul(A[k][j], factor);
+                    }
+                }
+            }
+        }
+
+        // Pre-compute vandermonde coefficients for present data blocks
+        let mut vandermonde_coeffs: Vec<Vec<u16>> = Vec::with_capacity(m);
+        for &rec_idx in present_recovery_indices.iter().take(m) {
+            let exponent = recovery_exponents[rec_idx - self.data_blocks] as usize;
+            let mut row_coeffs = Vec::with_capacity(present_data_indices.len());
+            for &data_idx in present_data_indices {
+                row_coeffs.push(gf_pow(self.constants[data_idx], exponent));
+            }
+            vandermonde_coeffs.push(row_coeffs);
+        }
+
+        tracing::debug!("Gaussian elimination transformation computed");
+
+        Ok(ReconstructionTransform {
+            row_order,
+            scale_factors,
+            elimination_factors,
+            vandermonde_coeffs,
+        })
+    }
+
+    /// Reconstruct missing blocks using streaming architecture
+    ///
+    /// This processes ONE BLOCK AT A TIME, never loading all blocks into memory.
+    /// Memory usage: (m + overhead) × chunk_size instead of n × chunk_size
+    ///
+    /// # Arguments
+    /// * `missing_indices` - Indices of missing data blocks
+    /// * `present_data_indices` - Indices of present data blocks
+    /// * `present_recovery_indices` - Indices of present recovery blocks (must have at least m)
+    /// * `transform` - Precomputed Gaussian elimination transformation
+    /// * `chunk_offset` - Byte offset within block
+    /// * `chunk_size` - Size of chunk to process
+    /// * `read_block` - Callback to read a chunk from a block: (block_idx, offset, size) -> data
+    /// * `write_result` - Callback to write reconstructed chunk: (missing_block_idx, data) -> ()
+    ///
+    /// # Returns
+    /// Ok(()) if reconstruction successful
+    #[allow(clippy::too_many_arguments)]
+    pub fn reconstruct_streaming_chunk<R, W>(
+        &self,
+        missing_indices: &[usize],
+        present_data_indices: &[usize],
+        present_recovery_indices: &[usize],
+        transform: &ReconstructionTransform,
+        chunk_offset: usize,
+        chunk_size: usize,
+        mut read_block: R,
+        mut write_result: W,
+    ) -> Result<(), String>
+    where
+        R: FnMut(usize, usize, usize) -> Result<Vec<u8>, String>,
+        W: FnMut(usize, Vec<u8>) -> Result<(), String>,
+    {
+        use std::time::Instant;
+        let start = Instant::now();
+
+        let m = missing_indices.len();
+        if m == 0 {
+            return Ok(());
+        }
+
+        if present_recovery_indices.len() < m {
+            return Err(format!(
+                "Need {} recovery blocks, have {}",
+                m,
+                present_recovery_indices.len()
+            ));
+        }
+
+        let chunk_symbols = chunk_size / 2;
+
+        tracing::debug!(
+            missing = m,
+            present_data = present_data_indices.len(),
+            chunk_offset = chunk_offset,
+            chunk_size = chunk_size,
+            "Starting streaming reconstruction for chunk"
+        );
+
+        // Use precomputed transformation matrices
+        let row_order = &transform.row_order;
+        let scale_factors = &transform.scale_factors;
+        let elimination_factors = &transform.elimination_factors;
+        let vandermonde_coeffs = &transform.vandermonde_coeffs;
+
+        let init_start = Instant::now();
+
+        let mut accumulators: Vec<Vec<u16>> = vec![vec![0u16; chunk_symbols]; m];
+
+        for (original_row, &rec_idx) in present_recovery_indices.iter().take(m).enumerate() {
+            let rec_chunk = read_block(rec_idx, chunk_offset, chunk_size)?;
+
+            let swapped_row = row_order.iter().position(|&r| r == original_row)
+                .ok_or_else(|| format!("Row {} not found in row_order", original_row))?;
+
+            // Convert bytes to u16 using SIMD
+            galois::bytes_to_u16_simd(&rec_chunk, &mut accumulators[swapped_row]);
+        }
+
+        tracing::debug!(
+            init_ms = init_start.elapsed().as_millis(),
+            "Accumulators initialized"
+        );
+
+        // PHASE 2: Stream through present data blocks ONE AT A TIME
+        let stream_start = Instant::now();
+
+        // Pre-allocate buffer for data chunk conversion (reused for each block)
+        let mut data_chunk_buf: Vec<u16> = vec![0u16; chunk_symbols];
+
+        for (data_col, &data_idx) in present_data_indices.iter().enumerate() {
+            // Read ONE block from disk via callback
+            let data_chunk_bytes = read_block(data_idx, chunk_offset, chunk_size)?;
+
+            // Convert to u16 in-place using SIMD (HOT PATH - called 1000s of times)
+            galois::bytes_to_u16_simd(&data_chunk_bytes, &mut data_chunk_buf[..chunk_symbols]);
+
+            // Process in row batches for SIMD
+            const ROW_BATCH_SIZE: usize = 8;
+            let mut row_batch_start = 0;
+            while row_batch_start < m {
+                let row_batch_end = (row_batch_start + ROW_BATCH_SIZE).min(m);
+                let batch_size = row_batch_end - row_batch_start;
+
+                let mut coeffs: Vec<u16> = Vec::with_capacity(batch_size);
+                #[allow(clippy::needless_range_loop)] // Need row index for 2D array access
+                for row in row_batch_start..row_batch_end {
+                    coeffs.push(vandermonde_coeffs[row][data_col]);
+                }
+
+                let mut acc_refs: Vec<&mut [u16]> = Vec::with_capacity(batch_size);
+                #[allow(clippy::needless_range_loop)]
+                // Need index for unsafe raw pointer manipulation
+                for row in row_batch_start..row_batch_end {
+                    // SAFETY: Each accumulators[row] is a distinct Vec<u16> allocation.
+                    // Converting to raw pointers allows collecting multiple mutable slices.
+                    // Safe because each row targets non-overlapping memory (different Vec allocations).
+                    unsafe {
+                        let ptr = accumulators[row].as_mut_ptr();
+                        acc_refs.push(std::slice::from_raw_parts_mut(ptr, chunk_symbols));
+                    }
+                }
+
+                gf_muladd_column(&mut acc_refs, &data_chunk_buf[..chunk_symbols], &coeffs);
+                row_batch_start = row_batch_end;
+            }
+        }
+
+        tracing::debug!(
+            stream_ms = stream_start.elapsed().as_millis(),
+            blocks_processed = present_data_indices.len(),
+            "Streaming subtraction complete"
+        );
+
+        // PHASE 4: Apply pre-computed Gaussian elimination to accumulators
+        let ge_start = Instant::now();
+
+        for k in 0..m {
+            let pivot = scale_factors[k];
+            if pivot != 1 {
+                for s in 0..chunk_symbols {
+                    if accumulators[k][s] != 0 {
+                        accumulators[k][s] = galois::gf_div(accumulators[k][s], pivot);
+                    }
+                }
             }
 
-            // Convert back to bytes
-            let mut block_bytes = Vec::with_capacity(block_size);
-            for &val in &reconstructed {
-                block_bytes.extend_from_slice(&val.to_le_bytes());
+            for r in 0..k {
+                let factor = elimination_factors[r][k];
+                if factor != 0 {
+                    let (first, second) = accumulators.split_at_mut(k);
+                    galois::gf_muladd(
+                        &mut first[r][..chunk_symbols],
+                        &second[0][..chunk_symbols],
+                        factor,
+                    );
+                }
             }
-            blocks[missing_idx] = Some(block_bytes);
+
+            #[allow(clippy::needless_range_loop)]
+            // Need r index for both elimination_factors[r] and split_at_mut(r)
+            for r in (k + 1)..m {
+                let factor = elimination_factors[r][k];
+                if factor != 0 {
+                    let (first, second) = accumulators.split_at_mut(r);
+                    galois::gf_muladd(
+                        &mut second[0][..chunk_symbols],
+                        &first[k][..chunk_symbols],
+                        factor,
+                    );
+                }
+            }
         }
+
+        tracing::debug!(
+            ge_ms = ge_start.elapsed().as_millis(),
+            "Gaussian elimination applied"
+        );
+
+        // PHASE 5: Write results via callback
+        let write_start = Instant::now();
+
+        for (row, &miss_idx) in missing_indices.iter().enumerate() {
+            let mut output = Vec::with_capacity(chunk_size);
+            for &val in &accumulators[row] {
+                output.extend_from_slice(&val.to_le_bytes());
+            }
+            write_result(miss_idx, output)?;
+        }
+
+        tracing::debug!(
+            write_ms = write_start.elapsed().as_millis(),
+            total_ms = start.elapsed().as_millis(),
+            "Streaming reconstruction complete"
+        );
 
         Ok(())
     }
 }
 
-/// Augmented Gaussian elimination matching par2cmdline's algorithm
-/// Solves the system using two matrices: left (coefficients) and right (identity -> solution)
-fn gauss_elim_augmented(
-    left_matrix: &mut [Vec<u16>],
-    right_matrix: &mut [Vec<u16>],
-    result: &mut [Vec<u16>],
-) -> Result<Vec<Vec<u16>>, String> {
-    let rows = right_matrix.len();
-    let leftcols = left_matrix[0].len();
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    // Solve one row at a time (only the first 'rows' rows, which correspond to missing data)
-    for row in 0..rows {
-        // Get the pivot value from the RIGHT matrix diagonal
-        let pivotvalue = right_matrix[row][row];
+    #[test]
+    fn test_encode_basic() {
+        // Create codec for 3 data blocks, generate 2 recovery blocks
+        let rs = Par2ReedSolomon::new(3, 2);
 
-        if pivotvalue == 0 {
-            return Err("RS computation error: pivot is zero".to_string());
-        }
+        // Create test data blocks (8 bytes each = 4 u16 symbols)
+        let data_blocks = vec![
+            vec![1, 0, 2, 0, 3, 0, 4, 0],    // [1, 2, 3, 4] in u16
+            vec![5, 0, 6, 0, 7, 0, 8, 0],    // [5, 6, 7, 8] in u16
+            vec![9, 0, 10, 0, 11, 0, 12, 0], // [9, 10, 11, 12] in u16
+        ];
 
-        // If the pivot value is not 1, scale the entire row
-        if pivotvalue != 1 {
-            // Scale left matrix
-            for col in 0..leftcols {
-                if left_matrix[row][col] != 0 {
-                    left_matrix[row][col] = gf_div(left_matrix[row][col], pivotvalue);
-                }
-            }
+        let result = rs.encode(&data_blocks, 2, 8).unwrap();
 
-            // Scale right matrix
-            right_matrix[row][row] = 1;
-            for col in (row + 1)..rows {
-                if right_matrix[row][col] != 0 {
-                    right_matrix[row][col] = gf_div(right_matrix[row][col], pivotvalue);
-                }
-            }
-
-            // Scale result
-            for i in 0..result[row].len() {
-                if result[row][i] != 0 {
-                    result[row][i] = gf_div(result[row][i], pivotvalue);
-                }
-            }
-        }
-
-        // For every OTHER row in the matrix
-        for row2 in 0..rows {
-            if row != row2 {
-                // Get the scaling factor from the right matrix
-                let scalevalue = right_matrix[row2][row];
-
-                if scalevalue == 1 {
-                    // If scaling factor is 1, just subtract rows (XOR in GF(2^n))
-                    for col in 0..leftcols {
-                        if left_matrix[row][col] != 0 {
-                            left_matrix[row2][col] ^= left_matrix[row][col];
-                        }
-                    }
-
-                    for col in row..rows {
-                        if right_matrix[row][col] != 0 {
-                            right_matrix[row2][col] ^= right_matrix[row][col];
-                        }
-                    }
-
-                    for i in 0..result[row].len() {
-                        if result[row][i] != 0 {
-                            result[row2][i] ^= result[row][i];
-                        }
-                    }
-                } else if scalevalue != 0 {
-                    // If scaling factor is not 0, multiply and subtract
-                    for col in 0..leftcols {
-                        if left_matrix[row][col] != 0 {
-                            let product = gf_mul(left_matrix[row][col], scalevalue);
-                            left_matrix[row2][col] ^= product;
-                        }
-                    }
-
-                    for col in row..rows {
-                        if right_matrix[row][col] != 0 {
-                            let product = gf_mul(right_matrix[row][col], scalevalue);
-                            right_matrix[row2][col] ^= product;
-                        }
-                    }
-
-                    for i in 0..result[row].len() {
-                        if result[row][i] != 0 {
-                            let product = gf_mul(result[row][i], scalevalue);
-                            result[row2][i] ^= product;
-                        }
-                    }
-                }
-            }
-        }
+        assert_eq!(result.len(), 2, "Should generate 2 recovery blocks");
+        assert_eq!(
+            result[0].0, 0,
+            "First recovery block should have exponent 0"
+        );
+        assert_eq!(
+            result[1].0, 1,
+            "Second recovery block should have exponent 1"
+        );
+        assert_eq!(result[0].1.len(), 8, "Recovery blocks should be 8 bytes");
+        assert_eq!(result[1].1.len(), 8, "Recovery blocks should be 8 bytes");
     }
 
-    Ok(result.to_vec())
+    #[test]
+    fn test_encode_wrong_block_count() {
+        let rs = Par2ReedSolomon::new(3, 2);
+        let data_blocks = vec![
+            vec![1, 0, 2, 0, 3, 0, 4, 0],
+            vec![5, 0, 6, 0, 7, 0, 8, 0],
+            // Missing third block
+        ];
+
+        let result = rs.encode(&data_blocks, 2, 8);
+        assert!(result.is_err(), "Should fail with wrong block count");
+    }
+
+    #[test]
+    fn test_encode_wrong_block_size() {
+        let rs = Par2ReedSolomon::new(2, 1);
+        let data_blocks = vec![
+            vec![1, 0, 2, 0, 3, 0, 4, 0], // 8 bytes
+            vec![5, 0, 6, 0],             // Only 4 bytes - mismatch!
+        ];
+
+        let result = rs.encode(&data_blocks, 1, 8);
+        assert!(result.is_err(), "Should fail with mismatched block sizes");
+    }
+
+    #[test]
+    fn test_encode_odd_block_size() {
+        let rs = Par2ReedSolomon::new(2, 1);
+        let data_blocks = vec![
+            vec![1, 2, 3], // 3 bytes - odd number
+            vec![4, 5, 6],
+        ];
+
+        let result = rs.encode(&data_blocks, 1, 3);
+        assert!(result.is_err(), "Should fail with odd block size");
+    }
 }

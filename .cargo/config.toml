@@ -1,0 +1,4 @@
+[build]
+rustflags = [
+    "-C", "target-cpu=native",  # Use native CPU features (NEON, CRC32, etc)
+]
