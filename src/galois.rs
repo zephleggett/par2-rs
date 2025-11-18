@@ -825,7 +825,6 @@ unsafe fn gf_mul_slice_ssse3(scalar: u16, data: &mut [u16]) {
 /// Based on par2cmdline-turbo's gf16pmul implementation.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "pclmulqdq,sse2,sse4.1")]
-#[inline(always)]
 unsafe fn gf_mul_pclmul_x86_8(data1: __m128i, data2: __m128i) -> __m128i {
     use std::arch::x86_64::*;
 
