@@ -3,7 +3,7 @@
 [![CI](https://github.com/zephleggett/par2-rs/workflows/CI/badge.svg)](https://github.com/zephleggett/par2-rs/actions)
 [![codecov](https://codecov.io/gh/zephleggett/par2-rs/branch/main/graph/badge.svg)](https://codecov.io/gh/zephleggett/par2-rs)
 
-> WARNING: This library is currently in alpha status. Testing has been performed on macOS ARM64 systems. Platform compatibility and behavior with diverse file types has not been extensively verified. No warranties are provided. Maintain backups of critical data.
+> WARNING: This library is currently in alpha status. Testing has been performed on my M1 Mac and GitHub CI only for x86. Platform compatibility and behavior with diverse file types has not been extensively verified. No warranties are provided. Maintain backups of critical data.
 
 This is a native Rust implementation of the PAR2 (Parchive 2.0) specification for file verification and repair using Reed-Solomon error correction codes over GF(2^16). The implementation provides repair performance approximately 44% faster than par2cmdline-turbo (a C++ implementation with hand-optimized ARM NEON assembly) on ARM64 hardware while maintaining comparable memory overhead.
 

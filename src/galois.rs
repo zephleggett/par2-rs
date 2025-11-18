@@ -295,17 +295,34 @@ pub fn gf_mul_slice(scalar: u16, data: &mut [u16]) {
 
     #[cfg(target_arch = "x86_64")]
     {
-        // Prefer PCLMULQDQ for best performance (equivalent to ARM's PMULL)
+        // Prefer widest/fastest PCLMUL variant available
+        // Priority: VPCLMUL+GFNI > VPCLMUL > AVX2 > SSE
+        #[cfg(feature = "unstable")]
+        {
+            if is_x86_feature_detected!("vpclmulqdq")
+                && is_x86_feature_detected!("avx512f")
+                && is_x86_feature_detected!("gfni")
+            {
+                unsafe { gf_mul_slice_vpclmul_gfni_x86(scalar, data) };
+                return;
+            }
+            if is_x86_feature_detected!("vpclmulqdq") && is_x86_feature_detected!("avx512f") {
+                unsafe { gf_mul_slice_vpclmul_x86(scalar, data) };
+                return;
+            }
+        }
+        if is_x86_feature_detected!("pclmulqdq")
+            && is_x86_feature_detected!("avx2")
+            && is_x86_feature_detected!("sse4.1")
+        {
+            unsafe { gf_mul_slice_avx2_pclmul_x86(scalar, data) };
+            return;
+        }
         if is_x86_feature_detected!("pclmulqdq") && is_x86_feature_detected!("sse4.1") {
             unsafe { gf_mul_slice_pclmul_x86(scalar, data) };
             return;
         }
-        // TODO: AVX2/SSSE3 table-based implementations need fixing - currently produce incorrect results
-        // Temporarily disabled in favor of PCLMUL or scalar fallback
-        // if is_x86_feature_detected!("avx2") {
-        //     unsafe { gf_mul_slice_avx2(scalar, data) };
-        //     return;
-        // }
+        // TODO: SSSE3 table-based fallback for 2006-2010 CPUs without PCLMUL
         // if is_x86_feature_detected!("ssse3") {
         //     unsafe { gf_mul_slice_ssse3(scalar, data) };
         //     return;
@@ -570,7 +587,7 @@ unsafe fn gf_muladd_neon(dst: &mut [u16], src: &[u16], scalar: u16) {
     gf_muladd_pmull_neon(dst, src, scalar);
 }
 
-/// x86 PCLMULQDQ implementation for gf_mul_slice
+/// x86 PCLMULQDQ implementation for gf_mul_slice (SSE version, 128-bit)
 ///
 /// Multiplies every element in the slice by a scalar using carryless multiplication.
 /// This is the x86 equivalent of ARM's PMULL-based implementation.
@@ -614,6 +631,80 @@ unsafe fn gf_mul_slice_pclmul_x86(scalar: u16, data: &mut [u16]) {
             *item = gf_mul(*item, scalar);
         }
     }
+}
+
+/// AVX2 PCLMULQDQ implementation for gf_mul_slice (256-bit, processes 16 u16 at once)
+///
+/// 2x wider than SSE version, processes 16 u16 values (32 bytes) per iteration.
+/// Available on Intel Haswell (2013+) and AMD Excavator (2015+).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "pclmulqdq,avx2,sse4.1")]
+unsafe fn gf_mul_slice_avx2_pclmul_x86(scalar: u16, data: &mut [u16]) {
+    use std::arch::x86_64::*;
+
+    if scalar == 0 {
+        for val in data.iter_mut() {
+            *val = 0;
+        }
+        return;
+    }
+
+    let scalar_vec = _mm_set1_epi16(scalar as i16);
+
+    // Process 16 u16 values (32 bytes) at a time using two 128-bit ops
+    let chunks = data.len() / 16;
+    let remainder = data.len() % 16;
+
+    for i in 0..chunks {
+        let offset = i * 16;
+
+        // Load and process first 8 u16
+        let data_vec1 = _mm_loadu_si128(data.as_ptr().add(offset) as *const __m128i);
+        let result1 = gf_mul_pclmul_x86_8(data_vec1, scalar_vec);
+        _mm_storeu_si128(data.as_mut_ptr().add(offset) as *mut __m128i, result1);
+
+        // Load and process second 8 u16
+        let data_vec2 = _mm_loadu_si128(data.as_ptr().add(offset + 8) as *const __m128i);
+        let result2 = gf_mul_pclmul_x86_8(data_vec2, scalar_vec);
+        _mm_storeu_si128(data.as_mut_ptr().add(offset + 8) as *mut __m128i, result2);
+    }
+
+    // Handle remainder with SSE
+    let start = chunks * 16;
+    if data.len() - start >= 8 {
+        let data_vec = _mm_loadu_si128(data.as_ptr().add(start) as *const __m128i);
+        let result = gf_mul_pclmul_x86_8(data_vec, scalar_vec);
+        _mm_storeu_si128(data.as_mut_ptr().add(start) as *mut __m128i, result);
+
+        // Handle final <8 elements with scalar
+        for item in data.iter_mut().skip(start + 8) {
+            *item = gf_mul(*item, scalar);
+        }
+    } else if remainder > 0 {
+        for item in data.iter_mut().skip(start) {
+            *item = gf_mul(*item, scalar);
+        }
+    }
+}
+
+/// Placeholder for VPCLMUL (AVX-512) - requires unstable features
+#[cfg(all(target_arch = "x86_64", feature = "unstable"))]
+#[allow(dead_code)]
+unsafe fn gf_mul_slice_vpclmul_x86(_scalar: u16, _data: &mut [u16]) {
+    // TODO: Implement AVX-512 VPCLMUL
+    // For now, fall back to AVX2
+    #[cfg(target_feature = "avx2")]
+    gf_mul_slice_avx2_pclmul_x86(_scalar, _data);
+}
+
+/// Placeholder for VPCLMUL+GFNI - requires unstable features
+#[cfg(all(target_arch = "x86_64", feature = "unstable"))]
+#[allow(dead_code)]
+unsafe fn gf_mul_slice_vpclmul_gfni_x86(_scalar: u16, _data: &mut [u16]) {
+    // TODO: Implement GFNI affine transformation
+    // For now, fall back to AVX2
+    #[cfg(target_feature = "avx2")]
+    gf_mul_slice_avx2_pclmul_x86(_scalar, _data);
 }
 
 /// AVX2 table-based multiplication: processes 32 u16 values (64 bytes) per iteration
