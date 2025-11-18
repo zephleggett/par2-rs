@@ -290,16 +290,19 @@ pub fn gf_pow(a: u16, n: usize) -> u16 {
 pub fn gf_mul_slice(scalar: u16, data: &mut [u16]) {
     init_tables(); // Ensure tables are initialized
 
+    // TODO: x86 AVX2/SSSE3 implementations need fixing - currently produce incorrect results
+    // Temporarily disabled in favor of scalar fallback
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") {
-            unsafe { gf_mul_slice_avx2(scalar, data) };
-            return;
-        }
-        if is_x86_feature_detected!("ssse3") {
-            unsafe { gf_mul_slice_ssse3(scalar, data) };
-            return;
-        }
+        let _ = (scalar, data); // Suppress unused warning for now
+        // if is_x86_feature_detected!("avx2") {
+        //     unsafe { gf_mul_slice_avx2(scalar, data) };
+        //     return;
+        // }
+        // if is_x86_feature_detected!("ssse3") {
+        //     unsafe { gf_mul_slice_ssse3(scalar, data) };
+        //     return;
+        // }
     }
 
     #[cfg(target_arch = "aarch64")]
