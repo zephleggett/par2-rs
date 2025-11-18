@@ -6,6 +6,10 @@ on:
   pull_request:
     branches: [ main ]
 
+# Set minimal permissions for all jobs by default
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
