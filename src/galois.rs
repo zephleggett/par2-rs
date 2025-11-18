@@ -814,23 +814,23 @@ unsafe fn gf_muladd_pclmul_x86(dst: &mut [u16], src: &[u16], scalar: u16) {
 
         // Low product: src_lo * scalar_lo
         let low_prod = _mm_clmulepi64_si128(
-            _mm_and_si128(src_lo, _mm_set1_epi64x(0xFFFFFFFFFFFFFFFF)),
-            _mm_cvtsi64_si128(scalar_lo as i64 * 0x0101010101010101u64 as i64),
+            _mm_and_si128(src_lo, _mm_set1_epi64x(-1)),
+            _mm_cvtsi64_si128((scalar_lo as u64 * 0x0101010101010101u64) as i64),
             0x00,
         );
 
         // High product: src_hi * scalar_hi
         let high_prod = _mm_clmulepi64_si128(
-            _mm_and_si128(src_hi, _mm_set1_epi64x(0xFFFFFFFFFFFFFFFF)),
-            _mm_cvtsi64_si128(scalar_hi as i64 * 0x0101010101010101u64 as i64),
+            _mm_and_si128(src_hi, _mm_set1_epi64x(-1)),
+            _mm_cvtsi64_si128((scalar_hi as u64 * 0x0101010101010101u64) as i64),
             0x00,
         );
 
         // Middle product: (src_lo XOR src_hi) * (scalar_lo XOR scalar_hi)
         let src_mid = _mm_xor_si128(src_lo, src_hi);
         let mid_prod = _mm_clmulepi64_si128(
-            _mm_and_si128(src_mid, _mm_set1_epi64x(0xFFFFFFFFFFFFFFFF)),
-            _mm_cvtsi64_si128(scalar_mid as i64 * 0x0101010101010101u64 as i64),
+            _mm_and_si128(src_mid, _mm_set1_epi64x(-1)),
+            _mm_cvtsi64_si128((scalar_mid as u64 * 0x0101010101010101u64) as i64),
             0x00,
         );
 
