@@ -118,6 +118,7 @@ pub(super) unsafe fn gf_mul_slice_avx2_pclmul_x86(scalar: u16, data: &mut [u16])
 /// # Safety
 /// Requires `vpclmulqdq` and `avx512f` CPU features.
 #[cfg(all(target_arch = "x86_64", feature = "unstable"))]
+#[allow(clippy::incompatible_msrv)]
 #[target_feature(enable = "vpclmulqdq,avx512f,avx512vl,sse4.1")]
 pub(super) unsafe fn gf_mul_pclmul_x86_32(data1: __m512i, data2: __m512i) -> __m512i {
     use std::arch::x86_64::*;
@@ -181,6 +182,7 @@ pub(super) unsafe fn gf_mul_pclmul_x86_32(data1: __m512i, data2: __m512i) -> __m
 /// Processes 32 u16 values (64 bytes) per iteration.
 /// Available on Intel Ice Lake (2019+) and AMD Zen 4 (2022+).
 #[cfg(all(target_arch = "x86_64", feature = "unstable"))]
+#[allow(clippy::incompatible_msrv)]
 #[target_feature(enable = "vpclmulqdq,avx512f,avx512vl,sse4.1")]
 pub(super) unsafe fn gf_mul_slice_vpclmul_x86(scalar: u16, data: &mut [u16]) {
     use std::arch::x86_64::*;
@@ -220,6 +222,7 @@ pub(super) unsafe fn gf_mul_slice_vpclmul_x86(scalar: u16, data: &mut [u16]) {
 /// Placeholder for VPCLMUL+GFNI - requires unstable features
 #[cfg(all(target_arch = "x86_64", feature = "unstable"))]
 #[allow(dead_code)]
+#[allow(clippy::incompatible_msrv)]
 pub(super) unsafe fn gf_mul_slice_vpclmul_gfni_x86(_scalar: u16, _data: &mut [u16]) {
     // TODO: Implement GFNI affine transformation
     // For now, fall back to AVX2
@@ -438,7 +441,6 @@ pub(super) unsafe fn gf_mul_slice_ssse3(scalar: u16, data: &mut [u16]) {
 /// Multiply 8 u16 values by a scalar using PCLMULQDQ+Barrett reduction
 ///
 /// Core GF(2^16) multiplication using carryless multiplication and Barrett reduction.
-/// Based on par2cmdline-turbo's gf16pmul implementation.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "pclmulqdq,sse2,sse4.1")]
 pub(super) unsafe fn gf_mul_pclmul_x86_8(data1: __m128i, data2: __m128i) -> __m128i {
@@ -602,6 +604,7 @@ pub(super) unsafe fn gf_muladd_avx2_pclmul_x86(dst: &mut [u16], src: &[u16], sca
 /// 4x wider than SSE version, 2x wider than AVX2 version.
 /// Processes 32 u16 values (64 bytes) per iteration.
 #[cfg(all(target_arch = "x86_64", feature = "unstable"))]
+#[allow(clippy::incompatible_msrv)]
 #[target_feature(enable = "vpclmulqdq,avx512f,avx512vl,sse4.1")]
 pub(super) unsafe fn gf_muladd_vpclmul_x86(dst: &mut [u16], src: &[u16], scalar: u16) {
     use std::arch::x86_64::*;
@@ -828,6 +831,7 @@ pub(super) unsafe fn gf_muladd_multi_avx2_pclmul_x86(
 /// 4x wider than SSE, 2x wider than AVX2. Processes up to 8 source regions simultaneously,
 /// accumulating products before XORing. Processes 32 u16 values (64 bytes) per iteration.
 #[cfg(all(target_arch = "x86_64", feature = "unstable"))]
+#[allow(clippy::incompatible_msrv)]
 #[target_feature(enable = "vpclmulqdq,avx512f,avx512vl,sse4.1")]
 pub(super) unsafe fn gf_muladd_multi_vpclmul_x86(
     dst: &mut [u16],
@@ -1065,6 +1069,7 @@ pub(super) unsafe fn gf_muladd_column_avx2_pclmul_x86(
 /// 4x wider than SSE, 2x wider than AVX2. One source contributes to multiple destinations,
 /// processing up to 8 destinations simultaneously. Processes 32 u16 values (64 bytes) per iteration.
 #[cfg(all(target_arch = "x86_64", feature = "unstable"))]
+#[allow(clippy::incompatible_msrv)]
 #[target_feature(enable = "vpclmulqdq,avx512f,avx512vl,sse4.1")]
 pub(super) unsafe fn gf_muladd_column_vpclmul_x86(
     destinations: &mut [&mut [u16]],
