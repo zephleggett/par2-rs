@@ -458,15 +458,19 @@ pub fn gf_muladd_column(destinations: &mut [&mut [u16]], source: &[u16], coeffic
         }
     }
 
-    // Scalar fallback: batch into groups of 8 for SIMD processing
-    let mut start = 0;
-    while start < destinations.len() {
-        let end = (start + 8).min(destinations.len());
-        let batch_dests = &mut destinations[start..end];
-        let batch_coeffs = &coefficients[start..end];
+    // Scalar fallback for non-ARM64 platforms
+    gf_muladd_column_scalar(destinations, source, coefficients);
+}
 
-        unsafe { gf_muladd_column_neon(batch_dests, source, batch_coeffs) };
-        start = end;
+/// Scalar fallback for column-wise multiply-add
+#[inline]
+fn gf_muladd_column_scalar(destinations: &mut [&mut [u16]], source: &[u16], coefficients: &[u16]) {
+    for (dst, &coeff) in destinations.iter_mut().zip(coefficients.iter()) {
+        if coeff != 0 {
+            for (d, &s) in dst.iter_mut().zip(source.iter()) {
+                *d ^= gf_mul(s, coeff);
+            }
+        }
     }
 }
 

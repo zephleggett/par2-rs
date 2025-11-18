@@ -56,7 +56,10 @@ fn test_block_size_not_multiple_of_4() {
     let creator = Par2Creator::new(vec![file]).unwrap();
     let result = creator.with_block_size(1001);
 
-    assert!(result.is_err(), "Should reject block size not multiple of 4");
+    assert!(
+        result.is_err(),
+        "Should reject block size not multiple of 4"
+    );
 }
 
 #[test]
@@ -171,7 +174,10 @@ fn test_zero_redundancy() {
     // But can't repair damage with zero redundancy
     corrupt_file(&file, 100, &[0xFF; 100]).unwrap();
     assert!(repairer.repair(false).is_err());
-    assert!(repairer.repair(true).is_err(), "Can't repair with 0% redundancy");
+    assert!(
+        repairer.repair(true).is_err(),
+        "Can't repair with 0% redundancy"
+    );
 }
 
 #[test]

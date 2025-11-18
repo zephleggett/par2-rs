@@ -291,7 +291,8 @@ impl Par2Creator {
         let recovery_set_id = compute_recovery_set_id(&main_body);
 
         // Step 7: Split recovery blocks into volumes
-        let mut volumes = split_into_volumes(recovery_result, self.volume_scheme, &self.output_path)?;
+        let mut volumes =
+            split_into_volumes(recovery_result, self.volume_scheme, &self.output_path)?;
 
         // Special case: if no recovery blocks (0% redundancy), create a main .par2 file with just metadata
         if volumes.is_empty() {

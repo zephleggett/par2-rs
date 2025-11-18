@@ -2,7 +2,6 @@
 
 use par2_rs::{Par2Creator, Par2Repairer};
 use std::fs;
-use std::io::Write;
 use tempfile::TempDir;
 
 mod common;
@@ -177,7 +176,7 @@ fn test_par2_with_corrupted_packet_header() {
 
     // PAR2 magic is 8 bytes, corrupt packet header after that
     if data.len() > 100 {
-        data[96] = 0xFF;  // Corrupt packet length
+        data[96] = 0xFF; // Corrupt packet length
         data[97] = 0xFF;
         data[98] = 0xFF;
         data[99] = 0xFF;

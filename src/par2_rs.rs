@@ -366,7 +366,9 @@ impl Par2ReedSolomon {
         for (original_row, &rec_idx) in present_recovery_indices.iter().take(m).enumerate() {
             let rec_chunk = read_block(rec_idx, chunk_offset, chunk_size)?;
 
-            let swapped_row = row_order.iter().position(|&r| r == original_row)
+            let swapped_row = row_order
+                .iter()
+                .position(|&r| r == original_row)
                 .ok_or_else(|| format!("Row {} not found in row_order", original_row))?;
 
             // Convert bytes to u16 using SIMD
