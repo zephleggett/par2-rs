@@ -29,7 +29,7 @@ pub fn repair_files_parallel(
 
     for file_info in &par2_data.files_in_order {
         let num_blocks =
-            ((file_info.length + par2_data.block_size - 1) / par2_data.block_size) as usize;
+            file_info.length.div_ceil(par2_data.block_size) as usize;
         file_block_map.insert(file_info.file_id, (total_blocks, num_blocks));
         total_blocks += num_blocks;
     }
@@ -103,7 +103,7 @@ pub fn repair_files_parallel(
     let num_cpus = num_cpus::get();
     const TARGET_CHUNK_SIZE: usize = 100_000; // 100KB chunks
     let chunk_size = (TARGET_CHUNK_SIZE.min(block_size) / 2) * 2;
-    let num_chunks = (block_size + chunk_size - 1) / chunk_size;
+    let num_chunks = block_size.div_ceil(chunk_size);
 
     let num_damaged = damaged_block_indices.len();
     tracing::info!(

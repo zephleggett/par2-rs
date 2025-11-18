@@ -249,6 +249,7 @@ impl Par2ReedSolomon {
             let pivot = A[k][k];
             scale_factors[k] = pivot;
             if pivot != 1 {
+                #[allow(clippy::needless_range_loop)]
                 for j in k..m {
                     if A[k][j] != 0 {
                         A[k][j] = galois::gf_div(A[k][j], pivot);
@@ -265,6 +266,7 @@ impl Par2ReedSolomon {
                 if factor == 0 {
                     continue;
                 }
+                #[allow(clippy::needless_range_loop)]
                 for j in k..m {
                     if A[k][j] != 0 {
                         A[r][j] ^= galois::gf_mul(A[k][j], factor);
@@ -436,6 +438,7 @@ impl Par2ReedSolomon {
         for k in 0..m {
             let pivot = scale_factors[k];
             if pivot != 1 {
+                #[allow(clippy::needless_range_loop)]
                 for s in 0..chunk_symbols {
                     if accumulators[k][s] != 0 {
                         accumulators[k][s] = galois::gf_div(accumulators[k][s], pivot);

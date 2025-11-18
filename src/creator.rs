@@ -71,7 +71,7 @@ fn hash_file(path: &Path) -> Result<FileHash> {
 fn read_file_blocks(path: &Path, block_size: u64) -> Result<Vec<Vec<u8>>> {
     let mut file = File::open(path)?;
     let file_size = file.metadata()?.len();
-    let num_blocks = ((file_size + block_size - 1) / block_size) as usize;
+    let num_blocks = file_size.div_ceil(block_size) as usize;
 
     let mut blocks = Vec::with_capacity(num_blocks);
     let mut buffer = vec![0u8; block_size as usize];
@@ -261,7 +261,7 @@ impl Par2Creator {
         let data_bytes = (num_data_blocks as u64) * block_size;
         let recovery_bytes =
             ((data_bytes as f64) * (self.redundancy_percent as f64 / 100.0)) as u64;
-        let num_recovery_blocks = ((recovery_bytes + block_size - 1) / block_size) as usize;
+        let num_recovery_blocks = recovery_bytes.div_ceil(block_size) as usize;
 
         tracing::info!(
             recovery_blocks = num_recovery_blocks,

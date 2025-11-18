@@ -222,7 +222,7 @@ pub fn write_recovery_slice_packet(
     // Recovery data
     let data = recovery_block
         .read_all()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
     body.extend_from_slice(&data);
 
     write_packet(writer, &packet_types::RECV_SLICE, recovery_set_id, &body)
