@@ -8,8 +8,8 @@
 //! **Testing Status**: These implementations follow the reference from reed-solomon-simd
 //! but have not been tested on x86-64 hardware. Scalar fallback ensures correctness.
 
-use std::arch::x86_64::*;
 use crate::galois::core::{gf_mul, initialize_mul128_table, LOG_TABLE, MUL128_TABLE};
+use std::arch::x86_64::*;
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "pclmulqdq,sse2,sse4.1")]
@@ -150,10 +150,9 @@ pub(super) unsafe fn gf_mul_pclmul_x86_32(data1: __m512i, data2: __m512i) -> __m
     // Barrett reduction: reduce 32-bit products to 16-bit GF(2^16) values
     // Split low/high 16-bit halves using shuffle
     let shuf_lo_hi = _mm512_set_epi8(
-        15, 14, 11, 10, 7, 6, 3, 2, 13, 12, 9, 8, 5, 4, 1, 0,
-        15, 14, 11, 10, 7, 6, 3, 2, 13, 12, 9, 8, 5, 4, 1, 0,
-        15, 14, 11, 10, 7, 6, 3, 2, 13, 12, 9, 8, 5, 4, 1, 0,
-        15, 14, 11, 10, 7, 6, 3, 2, 13, 12, 9, 8, 5, 4, 1, 0,
+        15, 14, 11, 10, 7, 6, 3, 2, 13, 12, 9, 8, 5, 4, 1, 0, 15, 14, 11, 10, 7, 6, 3, 2, 13, 12,
+        9, 8, 5, 4, 1, 0, 15, 14, 11, 10, 7, 6, 3, 2, 13, 12, 9, 8, 5, 4, 1, 0, 15, 14, 11, 10, 7,
+        6, 3, 2, 13, 12, 9, 8, 5, 4, 1, 0,
     );
     let tmp1 = _mm512_shuffle_epi8(prod1, shuf_lo_hi);
     let tmp2 = _mm512_shuffle_epi8(prod2, shuf_lo_hi);
@@ -644,7 +643,11 @@ pub(super) unsafe fn gf_muladd_vpclmul_x86(dst: &mut [u16], src: &[u16], scalar:
 /// Key optimization: batches multiple sources to maximize register utilization.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "pclmulqdq,sse2,sse4.1")]
-pub(super) unsafe fn gf_muladd_multi_pclmul_x86(dst: &mut [u16], sources: &[&[u16]], coefficients: &[u16]) {
+pub(super) unsafe fn gf_muladd_multi_pclmul_x86(
+    dst: &mut [u16],
+    sources: &[&[u16]],
+    coefficients: &[u16],
+) {
     use std::arch::x86_64::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 

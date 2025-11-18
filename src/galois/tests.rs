@@ -100,7 +100,7 @@ fn test_simd_mul_slice() {
     // Compute expected results using scalar multiplication
     for val in expected.iter_mut() {
         *val = gf_mul(*val, scalar);
-}
+    }
 
     // Use SIMD multiplication
     gf_mul_slice(scalar, &mut data);
@@ -115,7 +115,7 @@ fn test_bytes_to_u16_simd() {
     let test_cases = vec![
         vec![0x12, 0x34, 0x56, 0x78, 0xAB, 0xCD, 0xEF, 0x01], // 4 u16 values
         vec![0x00, 0x01, 0xFF, 0xFE, 0x12, 0x34],             // 3 u16 values
-        vec![0xAA; 32], // 16 u16 values (SIMD path on NEON)
+        vec![0xAA; 32],                                       // 16 u16 values (SIMD path on NEON)
         vec![
             0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E,
             0x0F, 0x10, 0x11, 0x12,
@@ -139,7 +139,7 @@ fn test_bytes_to_u16_simd() {
             "SIMD byte conversion should match scalar for input {:?}",
             bytes
         );
-}
+    }
 }
 
 #[test]
@@ -152,7 +152,7 @@ fn test_simd_mul_slice_32() {
 
     for val in expected.iter_mut() {
         *val = gf_mul(*val, scalar);
-}
+    }
 
     gf_mul_slice(scalar, &mut data);
 
@@ -172,7 +172,7 @@ fn test_simd_mul_slice_large() {
 
     for val in expected.iter_mut() {
         *val = gf_mul(*val, scalar);
-}
+    }
 
     gf_mul_slice(scalar, &mut data);
 

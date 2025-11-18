@@ -257,7 +257,11 @@ pub(crate) fn gf_muladd_scalar(dst: &mut [u16], src: &[u16], scalar: u16) {
 
 /// Scalar fallback for column multiply-add
 #[inline]
-pub(crate) fn gf_muladd_column_scalar(destinations: &mut [&mut [u16]], source: &[u16], coefficients: &[u16]) {
+pub(crate) fn gf_muladd_column_scalar(
+    destinations: &mut [&mut [u16]],
+    source: &[u16],
+    coefficients: &[u16],
+) {
     for (dst, &coeff) in destinations.iter_mut().zip(coefficients.iter()) {
         if coeff != 0 {
             for (d, &s) in dst.iter_mut().zip(source.iter()) {

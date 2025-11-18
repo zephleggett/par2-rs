@@ -47,32 +47,31 @@ mod arm;
 mod tests;
 
 // Re-export public API from core
-pub use core::{init_tables, gf_mul, gf_div, gf_pow};
+pub use core::{gf_div, gf_mul, gf_pow, init_tables};
 
 // Import private items needed for dispatch
-use core::{gf_mul_slice_scalar, gf_muladd_scalar, gf_muladd_column_scalar, gf_muladd_multi_scalar, bytes_to_u16_scalar};
+use core::{
+    bytes_to_u16_scalar, gf_mul_slice_scalar, gf_muladd_column_scalar, gf_muladd_multi_scalar,
+    gf_muladd_scalar,
+};
 
 #[cfg(target_arch = "x86_64")]
 use x86::{
-    gf_mul_slice_pclmul_x86, gf_mul_slice_avx2_pclmul_x86,
-    gf_muladd_pclmul_x86, gf_muladd_avx2_pclmul_x86,
-    gf_muladd_multi_pclmul_x86, gf_muladd_multi_avx2_pclmul_x86,
-    gf_muladd_column_pclmul_x86, gf_muladd_column_avx2_pclmul_x86,
+    gf_mul_slice_avx2_pclmul_x86, gf_mul_slice_pclmul_x86, gf_muladd_avx2_pclmul_x86,
+    gf_muladd_column_avx2_pclmul_x86, gf_muladd_column_pclmul_x86, gf_muladd_multi_avx2_pclmul_x86,
+    gf_muladd_multi_pclmul_x86, gf_muladd_pclmul_x86,
 };
 
 #[cfg(all(target_arch = "x86_64", feature = "unstable"))]
 use x86::{
-    gf_mul_slice_vpclmul_x86, gf_mul_slice_vpclmul_gfni_x86,
-    gf_muladd_vpclmul_x86,
-    gf_muladd_multi_vpclmul_x86,
-    gf_muladd_column_vpclmul_x86,
+    gf_mul_slice_vpclmul_gfni_x86, gf_mul_slice_vpclmul_x86, gf_muladd_column_vpclmul_x86,
+    gf_muladd_multi_vpclmul_x86, gf_muladd_vpclmul_x86,
 };
 
 #[cfg(target_arch = "aarch64")]
 use arm::{
-    gf_mul_slice_pmull_neon, gf_mul_slice_neon,
-    gf_muladd_pmull_neon, gf_muladd_multi_pmull_neon, gf_muladd_column_neon,
-    bytes_to_u16_neon,
+    bytes_to_u16_neon, gf_mul_slice_neon, gf_mul_slice_pmull_neon, gf_muladd_column_neon,
+    gf_muladd_multi_pmull_neon, gf_muladd_pmull_neon,
 };
 
 // ======================================================================

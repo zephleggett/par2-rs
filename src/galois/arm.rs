@@ -6,8 +6,8 @@
 //!
 //! **Testing Status**: Fully tested and verified on Apple Silicon with 8-10x speedup
 
-use std::arch::aarch64::*;
 use crate::galois::core::{gf_mul, initialize_mul128_table, LOG_TABLE, MUL128_TABLE};
+use std::arch::aarch64::*;
 
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
@@ -491,7 +491,11 @@ pub(super) unsafe fn gf_muladd_pmull_neon(dst: &mut [u16], src: &[u16], scalar: 
 /// Processes 16 u16 values (32 bytes) per iteration with PMULL for each of 8 regions.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-pub(super) unsafe fn gf_muladd_multi_pmull_neon(dst: &mut [u16], sources: &[&[u16]], coefficients: &[u16]) {
+pub(super) unsafe fn gf_muladd_multi_pmull_neon(
+    dst: &mut [u16],
+    sources: &[&[u16]],
+    coefficients: &[u16],
+) {
     static mut CALL_COUNT: usize = 0;
     CALL_COUNT += 1;
     if CALL_COUNT == 1 {
@@ -796,4 +800,3 @@ fn bytes_to_u16_scalar(bytes: &[u8], output: &mut [u16]) {
         output[i] = u16::from_le_bytes([chunk[0], chunk[1]]);
     }
 }
-
