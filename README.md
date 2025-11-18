@@ -139,7 +139,12 @@ The ARM64 codepath is fully optimized and tested. Galois field arithmetic uses P
 The x86-64 implementation provides carryless multiplication (PCLMULQDQ) with runtime feature detection and automatic fallback.
 
 **SIMD Feature Ladder**:
-- **AVX2 PCLMUL** (if available): Carryless multiplication with AVX2 width
+- **VPCLMUL** (AVX-512): 512-bit carryless multiplication with Barrett reduction
+  - Processes 32 u16 values (64 bytes) per iteration
+  - Requires: Intel Ice Lake (2019+) or AMD Zen 4 (2022+)
+  - Gated behind `unstable` feature flag
+  - All tests pass on GitHub Actions x86 runners
+- **AVX2 PCLMUL** (fallback): Carryless multiplication with AVX2 width
   - Processes 16 u16 values (32 bytes) per iteration
   - Requires: Intel Haswell (2013+) or AMD Excavator (2015+)
   - Uses two 128-bit PCLMUL operations per chunk
@@ -153,9 +158,9 @@ The x86-64 implementation provides carryless multiplication (PCLMULQDQ) with run
   - Works on all CPUs
 
 **Future x86 SIMD (planned)**:
-- **VPCLMUL + GFNI** (AVX-512): 512-bit carryless multiplication with affine transformations
-  - Requires: Ice Lake (2019+) or Zen 4 (2022+)
-  - Gated behind `unstable` feature flag
+- **VPCLMUL + GFNI** (AVX-512): GFNI affine transformations for even faster multiplication
+  - Requires: Ice Lake (2019+) or Zen 4 (2022+) with GFNI support
+  - Placeholder implementation exists under `unstable` feature flag
 - **SSSE3 table-based** (for 2006-2010 CPUs): Nibble-based lookup tables
   - For CPUs with SSSE3 but without PCLMULQDQ
   - Currently produces incorrect results, needs fixing
@@ -186,7 +191,7 @@ The test suite comprises 104 unit and integration tests covering core functional
 
 Contributions are accepted. The following areas would benefit from additional development:
 
-- **AVX-512 SIMD**: Implement VPCLMUL and GFNI-based Galois field multiplication for Ice Lake+ and Zen 4+ CPUs. Placeholder functions exist under the `unstable` feature flag.
+- **AVX-512 GFNI**: Implement GFNI-based affine transformations for Galois field multiplication on Ice Lake+ and Zen 4+ CPUs. Placeholder implementation exists under the `unstable` feature flag.
 
 - **SSSE3 Table-based SIMD**: Fix the table-based shuffle implementation for 2006-2010 era CPUs without PCLMULQDQ. Currently produces incorrect results.
 
