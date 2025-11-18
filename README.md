@@ -2,6 +2,10 @@
 
 [![CI](https://github.com/zephleggett/par2-rs/workflows/CI/badge.svg)](https://github.com/zephleggett/par2-rs/actions)
 [![codecov](https://codecov.io/gh/zephleggett/par2-rs/branch/main/graph/badge.svg)](https://codecov.io/gh/zephleggett/par2-rs)
+[![Crates.io](https://img.shields.io/crates/v/par2-rs.svg)](https://crates.io/crates/par2-rs)
+[![Documentation](https://docs.rs/par2-rs/badge.svg)](https://docs.rs/par2-rs)
+[![License](https://img.shields.io/crates/l/par2-rs.svg)](https://github.com/zephleggett/par2-rs#license)
+[![MSRV](https://img.shields.io/badge/MSRV-1.76.0-blue.svg)](https://blog.rust-lang.org/2024/02/08/Rust-1.76.0.html)
 
 > WARNING: This library is currently in alpha status. Testing has been performed on my M1 Mac and GitHub CI only for x86. Platform compatibility and behavior with diverse file types has not been extensively verified. No warranties are provided. Maintain backups of critical data.
 
@@ -189,7 +193,9 @@ The test suite comprises 104 unit and integration tests covering core functional
 
 ## Contributing
 
-Contributions are accepted. The following areas would benefit from additional development:
+Contributions are accepted. Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+
+The following areas would benefit from additional development:
 
 - **AVX-512 GFNI**: Implement GFNI-based affine transformations for Galois field multiplication on Ice Lake+ and Zen 4+ CPUs. Placeholder implementation exists under the `unstable` feature flag.
 
@@ -202,6 +208,8 @@ Contributions are accepted. The following areas would benefit from additional de
 - **Benchmark Coverage**: Current benchmarks focus on a single file size and damage pattern. Additional test cases covering diverse file sizes, block counts, and corruption scenarios would provide better performance characterization.
 
 - **Unicode Filenames**: The current implementation supports ASCII filenames only. Adding Unicode filename packet support would improve compatibility with international character sets.
+
+For security vulnerabilities, please see our [Security Policy](SECURITY.md).
 
 ## Acknowledgments
 
