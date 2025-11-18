@@ -1,0 +1,37 @@
+# Rustfmt configuration for par2-rs
+# https://rust-lang.github.io/rustfmt/
+
+# Use the 2021 edition style
+edition = "2021"
+
+# Maximum width of a line
+max_width = 100
+
+# Use tabs or spaces
+hard_tabs = false
+tab_spaces = 4
+
+# Import organization
+imports_granularity = "Crate"
+group_imports = "StdExternalCrate"
+
+# Comment formatting
+normalize_comments = true
+wrap_comments = true
+comment_width = 100
+
+# Control flow formatting
+use_small_heuristics = "Default"
+use_try_shorthand = true
+
+# Array/function call formatting
+use_field_init_shorthand = true
+
+# Match formatting
+match_block_trailing_comma = true
+
+# Chain formatting
+chain_width = 80
+
+# Miscellaneous
+newline_style = "Unix"

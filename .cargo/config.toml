@@ -1,4 +1,27 @@
+# Build configuration for par2-rs
+#
+# IMPORTANT: The target-cpu=native flag below optimizes for the CPU it's built on.
+# This is great for local builds but makes the binary non-portable.
+#
+# For distribution:
+# - Remove or comment out the target-cpu=native flag
+# - Or use RUSTFLAGS="" cargo build to override
+# - Or build in release mode which has separate settings
+#
+# The library uses runtime CPU feature detection for SIMD,
+# so it will automatically use the best available instructions
+# even without target-cpu=native.
+
 [build]
-rustflags = [
-    "-C", "target-cpu=native",  # Use native CPU features (NEON, CRC32, etc)
-]
+# Uncomment for maximum local performance (binary won't be portable)
+# rustflags = [
+#     "-C", "target-cpu=native",
+# ]
+
+# Alternative: Enable specific features that are widely available
+# rustflags = [
+#     "-C", "target-feature=+aes,+sse2,+sse4.1",  # x86-64
+#     # or
+#     "-C", "target-feature=+neon",  # ARM64
+# ]
+

@@ -1,0 +1,22 @@
+# Clippy configuration for par2-rs
+# https://doc.rust-lang.org/clippy/lint_configuration.html
+
+# Warn on missing documentation for public items
+# (currently allowing since the codebase doesn't have full docs yet)
+# missing-docs-in-crate-items = "warn"
+
+# Cognitive complexity threshold - warn on functions that are too complex
+cognitive-complexity-threshold = 30
+
+# Warn on too many arguments to functions
+too-many-arguments-threshold = 8
+
+# Warn on too many lines in a function
+too-many-lines-threshold = 150
+
+# Allow certain lints that may be overly restrictive for this codebase
+# These are disabled because:
+# - Similar names are OK when they're in different contexts
+# - Single character variable names are OK in mathematical contexts (i, j, x, y)
+# - Module inception (mod foo { pub use foo::*; }) is a valid pattern
+avoid-breaking-exported-api = false

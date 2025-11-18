@@ -27,6 +27,21 @@
 //! been validated on actual x86-64 hardware. Scalar fallback ensures correctness on
 //! all platforms. If you encounter issues on x86-64, please report them.
 //!
+//! # Safety
+//!
+//! This module uses `unsafe` code for SIMD operations. All unsafe code is protected by:
+//!
+//! 1. **Runtime CPU feature detection**: Using `is_x86_feature_detected!()` and
+//!    `is_aarch64_feature_detected!()` macros to verify CPU support before calling
+//!    SIMD functions.
+//! 2. **Target feature attributes**: All SIMD functions are marked with `#[target_feature]`
+//!    to ensure they're only compiled when the feature is available.
+//! 3. **Memory safety**: All pointer operations respect slice bounds and alignment
+//!    requirements. SIMD loads/stores use unaligned operations (`loadu`/`storeu`)
+//!    to handle arbitrary data alignment.
+//! 4. **Automatic fallback**: If SIMD features are not available, the code automatically
+//!    falls back to safe scalar implementations.
+//!
 //! # Module Organization
 //!
 //! - `core`: Core GF(2^16) operations, tables, and scalar fallbacks
@@ -158,7 +173,7 @@ pub fn gf_mul_slice(scalar: u16, data: &mut [u16]) {
 // Multiply-Add Operations (Fused)
 // ======================================================================
 
-/// Fused multiply-add: dst[i] ^= scalar * src[i] for all i
+/// Fused multiply-add: `dst[i] ^= scalar * src[i]` for all i
 ///
 /// This is the core operation for Reed-Solomon encoding/decoding.
 /// Instead of separate mul+add passes, this performs both in a single
@@ -217,7 +232,7 @@ pub fn gf_muladd(dst: &mut [u16], src: &[u16], scalar: u16) {
     gf_muladd_scalar(dst, src, scalar);
 }
 
-/// Multi-region multiply-add: dst[i] ^= sum(coefficients[j] * sources[j][i])
+/// Multi-region multiply-add: `dst[i] ^= sum(coefficients[j] * sources[j][i])`
 ///
 /// Key optimization: instead of processing each source separately, we process
 /// multiple sources together to maximize register usage and reduce memory traffic.
@@ -289,7 +304,7 @@ pub fn gf_muladd_multi(dst: &mut [u16], sources: &[&[u16]], coefficients: &[u16]
     gf_muladd_multi_scalar(dst, sources, coefficients);
 }
 
-/// Column-wise multiply-add: destinations[j][i] ^= source[i] * coefficients[j] for all j
+/// Column-wise multiply-add: `destinations[j][i] ^= source[i] * coefficients[j]` for all j
 ///
 /// This is the inverse of gf_muladd_multi - one source contributes to multiple destinations.
 /// Optimized for column-wise matrix operations in PAR2 reconstruction.

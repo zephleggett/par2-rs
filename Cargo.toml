@@ -18,6 +18,13 @@ exclude = [
     "tmp/",
 ]
 
+# Cargo.toml metadata for better discoverability
+[package.metadata.docs.rs]
+# Build documentation with all features enabled
+all-features = true
+# Use nightly to enable unstable features in docs
+rustdoc-args = ["--cfg", "docsrs"]
+
 [dependencies]
 md-5 = "0.10"
 crc32fast = "1.4"
