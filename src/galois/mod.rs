@@ -186,6 +186,16 @@ pub fn gf_muladd(dst: &mut [u16], src: &[u16], scalar: u16) {
 
     #[cfg(target_arch = "x86_64")]
     {
+        #[cfg(feature = "unstable")]
+        {
+            if is_x86_feature_detected!("vpclmulqdq")
+                && is_x86_feature_detected!("avx512f")
+                && is_x86_feature_detected!("avx512vl")
+            {
+                unsafe { gf_muladd_vpclmul_x86(dst, src, scalar) };
+                return;
+            }
+        }
         if is_x86_feature_detected!("pclmulqdq")
             && is_x86_feature_detected!("avx2")
             && is_x86_feature_detected!("sse4.1")
@@ -243,6 +253,17 @@ pub fn gf_muladd_multi(dst: &mut [u16], sources: &[&[u16]], coefficients: &[u16]
 
     #[cfg(target_arch = "x86_64")]
     {
+        #[cfg(feature = "unstable")]
+        {
+            if is_x86_feature_detected!("vpclmulqdq")
+                && is_x86_feature_detected!("avx512f")
+                && is_x86_feature_detected!("avx512vl")
+                && sources.len() <= 8
+            {
+                unsafe { gf_muladd_multi_vpclmul_x86(dst, sources, coefficients) };
+                return;
+            }
+        }
         if is_x86_feature_detected!("pclmulqdq")
             && is_x86_feature_detected!("avx2")
             && is_x86_feature_detected!("sse4.1")
@@ -304,6 +325,17 @@ pub fn gf_muladd_column(destinations: &mut [&mut [u16]], source: &[u16], coeffic
 
     #[cfg(target_arch = "x86_64")]
     {
+        #[cfg(feature = "unstable")]
+        {
+            if is_x86_feature_detected!("vpclmulqdq")
+                && is_x86_feature_detected!("avx512f")
+                && is_x86_feature_detected!("avx512vl")
+                && destinations.len() <= 8
+            {
+                unsafe { gf_muladd_column_vpclmul_x86(destinations, source, coefficients) };
+                return;
+            }
+        }
         if is_x86_feature_detected!("pclmulqdq")
             && is_x86_feature_detected!("avx2")
             && is_x86_feature_detected!("sse4.1")
