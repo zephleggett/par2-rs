@@ -57,6 +57,7 @@ static EXP_TABLE: OnceLock<Box<[u16; GF_SIZE * 2]>> = OnceLock::new();
 /// Algorithm adapted from reed-solomon-simd by Anders Trier Olesen
 /// <https://github.com/AndersTrier/reed-solomon-simd>
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 struct Multiply128Lut {
     /// Lower byte of products
     lo: [u128; 4],
@@ -66,6 +67,7 @@ struct Multiply128Lut {
 
 /// SIMD lookup table: one entry per possible logarithm value
 /// Lazily initialized only on platforms that need it (x86_64 primarily)
+#[allow(dead_code)]
 static MUL128_TABLE: OnceLock<Box<[Multiply128Lut; GF_SIZE]>> = OnceLock::new();
 
 /// Initialize lookup tables for GF(2^16) arithmetic.
@@ -123,6 +125,7 @@ pub fn init_tables() {
 /// modified to use PAR2's primitive polynomial 0x1100B instead of Leopard-RS's 0x1002D.
 ///
 /// Reference: <https://github.com/AndersTrier/reed-solomon-simd>
+#[allow(dead_code)]
 fn initialize_mul128_table() {
     MUL128_TABLE.get_or_init(|| {
         // Ensure LOG/EXP tables are initialized first
@@ -624,6 +627,7 @@ unsafe fn gf_mul_slice_pclmul_x86(scalar: u16, data: &mut [u16]) {
 /// Reference: <https://github.com/AndersTrier/reed-solomon-simd>
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+#[allow(dead_code)]
 unsafe fn gf_mul_slice_avx2(scalar: u16, data: &mut [u16]) {
     // Handle zero scalar
     if scalar == 0 {
@@ -729,6 +733,7 @@ unsafe fn gf_mul_slice_avx2(scalar: u16, data: &mut [u16]) {
 /// Reference: <https://github.com/AndersTrier/reed-solomon-simd>
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "ssse3")]
+#[allow(dead_code)]
 unsafe fn gf_mul_slice_ssse3(scalar: u16, data: &mut [u16]) {
     if scalar == 0 {
         for val in data.iter_mut() {
@@ -829,13 +834,16 @@ unsafe fn gf_mul_pclmul_x86_8(data1: __m128i, data2: __m128i) -> __m128i {
     use std::arch::x86_64::*;
 
     // Split into even/odd u16 values for parallel processing
-    // Even indices: 0, 2, 4, 6
-    let data1_even = _mm_and_si128(data1, _mm_set1_epi32(0x0000FFFF_u32 as i32));
-    let data2_even = _mm_and_si128(data2, _mm_set1_epi32(0x0000FFFF_u32 as i32));
+    // wordMask selects even u16 values (positions 0, 2, 4, 6)
+    let word_mask = _mm_set1_epi32(0x0000FFFF_u32 as i32);
 
-    // Odd indices: 1, 3, 5, 7 (shifted down)
-    let data1_odd = _mm_srli_epi32(data1, 16);
-    let data2_odd = _mm_srli_epi32(data2, 16);
+    // Even indices: keep in place, mask out odd
+    let data1_even = _mm_and_si128(word_mask, data1);
+    let data2_even = _mm_and_si128(word_mask, data2);
+
+    // Odd indices: keep in place (andnot masks out even)
+    let data1_odd = _mm_andnot_si128(word_mask, data1);
+    let data2_odd = _mm_andnot_si128(word_mask, data2);
 
     // Carryless multiplication - produces 32-bit products
     // 0x00: multiply low qwords
