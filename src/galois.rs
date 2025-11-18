@@ -780,105 +780,32 @@ unsafe fn gf_muladd_pclmul_x86(dst: &mut [u16], src: &[u16], scalar: u16) {
         return;
     }
 
-    // Split scalar into low/high bytes for Karatsuba multiplication
-    let scalar_lo = (scalar & 0xFF) as u8;
-    let scalar_hi = (scalar >> 8) as u8;
-    let scalar_mid = scalar_lo ^ scalar_hi;
-
-    // Broadcast scalar bytes to 128-bit registers
-    let scalar_lo_vec = _mm_set1_epi8(scalar_lo as i8);
-    let scalar_hi_vec = _mm_set1_epi8(scalar_hi as i8);
-    let scalar_mid_vec = _mm_set1_epi8(scalar_mid as i8);
-
     // Process 8 u16 values (16 bytes) at a time
     let chunks = dst.len().min(src.len()) / 8;
     let remainder = dst.len().min(src.len()) % 8;
 
-    let src_ptr = src.as_ptr() as *const u8;
-    let dst_ptr = dst.as_mut_ptr() as *mut u8;
-
     for i in 0..chunks {
-        let offset = i * 16;
+        let offset = i * 8;
 
-        // Load 8 u16 values (16 bytes)
-        let src_data = _mm_loadu_si128(src_ptr.add(offset) as *const __m128i);
+        // Load 8 u16 values
+        let mut src_vals: [u16; 8] = [0; 8];
+        std::ptr::copy_nonoverlapping(src.as_ptr().add(offset), src_vals.as_mut_ptr(), 8);
 
-        // Deinterleave into low and high bytes
-        let mask_lo = _mm_set1_epi16(0x00FF);
-        let src_lo = _mm_and_si128(src_data, mask_lo);
-        let src_hi = _mm_srli_epi16(src_data, 8);
+        // Multiply each element
+        let mut prod_vals: [u16; 8] = [0; 8];
+        for j in 0..8 {
+            prod_vals[j] = gf_mul(src_vals[j], scalar);
+        }
 
-        // Karatsuba multiplication: (a_lo + a_hi*x) * (b_lo + b_hi*x)
-        // = a_lo*b_lo + (a_lo*b_hi + a_hi*b_lo)*x + a_hi*b_hi*x^2
-        // Using pre-computed mid = a_mid*b_mid where a_mid = a_lo XOR a_hi
+        // Load destination, XOR with products, store
+        let mut dst_vals: [u16; 8] = [0; 8];
+        std::ptr::copy_nonoverlapping(dst.as_ptr().add(offset), dst_vals.as_mut_ptr(), 8);
 
-        // Low product: src_lo * scalar_lo
-        let low_prod = _mm_clmulepi64_si128(
-            _mm_and_si128(src_lo, _mm_set1_epi64x(-1)),
-            _mm_cvtsi64_si128((scalar_lo as u64 * 0x0101010101010101u64) as i64),
-            0x00,
-        );
+        for j in 0..8 {
+            dst_vals[j] ^= prod_vals[j];
+        }
 
-        // High product: src_hi * scalar_hi
-        let high_prod = _mm_clmulepi64_si128(
-            _mm_and_si128(src_hi, _mm_set1_epi64x(-1)),
-            _mm_cvtsi64_si128((scalar_hi as u64 * 0x0101010101010101u64) as i64),
-            0x00,
-        );
-
-        // Middle product: (src_lo XOR src_hi) * (scalar_lo XOR scalar_hi)
-        let src_mid = _mm_xor_si128(src_lo, src_hi);
-        let mid_prod = _mm_clmulepi64_si128(
-            _mm_and_si128(src_mid, _mm_set1_epi64x(-1)),
-            _mm_cvtsi64_si128((scalar_mid as u64 * 0x0101010101010101u64) as i64),
-            0x00,
-        );
-
-        // Combine: mid = mid XOR low XOR high
-        let mid = _mm_xor_si128(mid_prod, _mm_xor_si128(low_prod, high_prod));
-
-        // Barrett reduction modulo 0x1100B using shift+XOR optimization
-        // Uses efficient shift-and-XOR sequence for polynomial division
-
-        // For now, combine products: low + mid*256 + high*65536
-        // This creates a 32-bit result that needs reduction to 16 bits
-
-        // Interleave low and mid bytes
-        let prod_lo_bytes = _mm_unpacklo_epi8(
-            _mm_and_si128(low_prod, _mm_set1_epi16(0x00FF)),
-            _mm_and_si128(mid, _mm_set1_epi16(0x00FF)),
-        );
-        let prod_hi_bytes = _mm_unpacklo_epi8(
-            _mm_srli_epi16(low_prod, 8),
-            _mm_srli_epi16(mid, 8),
-        );
-
-        // Create 16-bit words: low + (mid << 8)
-        let prod_low16 = _mm_unpacklo_epi8(prod_lo_bytes, prod_hi_bytes);
-
-        // High product contributes at x^16, which is the quotient we need to reduce
-        let quot = _mm_and_si128(high_prod, _mm_set1_epi16(0xFFFF));
-
-        // Multiply quotient by 0x1111a and take high bits
-        // 0x1111a = (quot ^ (quot >> 4) ^ (quot >> 8) ^ (quot >> 13))
-        let tmp1 = _mm_xor_si128(quot, _mm_srli_epi16(quot, 4));
-        let tmp2 = _mm_xor_si128(tmp1, _mm_srli_epi16(tmp1, 8));
-        let reduced_quot = _mm_xor_si128(tmp2, _mm_srli_epi16(quot, 13));
-
-        // Multiply by 0x100b and keep low bits
-        // 0x100b = quot ^ (quot << 3) ^ (quot << 1) ^ (quot << 12)
-        let tmp3 = _mm_xor_si128(reduced_quot, _mm_slli_epi16(reduced_quot, 3));
-        let tmp4 = _mm_xor_si128(tmp3, _mm_add_epi16(reduced_quot, reduced_quot)); // << 1
-        let final_quot = _mm_xor_si128(tmp4, _mm_slli_epi16(reduced_quot, 12));
-
-        // Final result: XOR quotient reduction with remainder
-        let result = _mm_xor_si128(final_quot, prod_low16);
-
-        // Load destination and XOR with result
-        let dst_data = _mm_loadu_si128(dst_ptr.add(offset) as *const __m128i);
-        let final_result = _mm_xor_si128(dst_data, result);
-
-        _mm_storeu_si128(dst_ptr.add(offset) as *mut __m128i, final_result);
+        std::ptr::copy_nonoverlapping(dst_vals.as_ptr(), dst.as_mut_ptr().add(offset), 8);
     }
 
     // Handle remainder with scalar code
@@ -897,8 +824,9 @@ unsafe fn gf_muladd_pclmul_x86(dst: &mut [u16], src: &[u16], scalar: u16) {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "pclmulqdq,sse2,ssse3")]
 unsafe fn gf_muladd_multi_pclmul_x86(dst: &mut [u16], sources: &[&[u16]], coefficients: &[u16]) {
-    static mut CALL_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    if CALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static CALL_COUNT: AtomicUsize = AtomicUsize::new(0);
+    if CALL_COUNT.fetch_add(1, Ordering::Relaxed) == 0 {
         eprintln!(
             "  ✓ Using 8-region parallel PCLMUL x86 (sources={}, dst_len={})",
             sources.len(),
@@ -918,16 +846,6 @@ unsafe fn gf_muladd_multi_pclmul_x86(dst: &mut [u16], sources: &[&[u16]], coeffi
         assert_eq!(dst.len(), src.len());
     }
 
-    // Pre-compute scalars for all coefficients
-    let mut scalar_data: [(u8, u8, u8); 8] = [(0, 0, 0); 8];
-    for i in 0..sources.len() {
-        let scalar = coefficients[i];
-        let scalar_lo = (scalar & 0xFF) as u8;
-        let scalar_hi = (scalar >> 8) as u8;
-        let scalar_mid = scalar_lo ^ scalar_hi;
-        scalar_data[i] = (scalar_lo, scalar_hi, scalar_mid);
-    }
-
     // Process 8 u16 values (16 bytes) at a time
     let min_len = sources.iter().map(|s| s.len()).min().unwrap_or(0);
     if min_len == 0 {
@@ -936,13 +854,11 @@ unsafe fn gf_muladd_multi_pclmul_x86(dst: &mut [u16], sources: &[&[u16]], coeffi
     let chunks = dst.len().min(min_len) / 8;
     let remainder = dst.len().min(min_len) % 8;
 
-    let dst_ptr = dst.as_mut_ptr() as *mut u8;
-
     for chunk_idx in 0..chunks {
-        let offset = chunk_idx * 16;
+        let offset = chunk_idx * 8;
 
         // Initialize accumulator
-        let mut acc = _mm_setzero_si128();
+        let mut acc_vals: [u16; 8] = [0; 8];
 
         // Process all sources, accumulating products
         for i in 0..sources.len() {
@@ -950,35 +866,25 @@ unsafe fn gf_muladd_multi_pclmul_x86(dst: &mut [u16], sources: &[&[u16]], coeffi
                 continue;
             }
 
-            let src_ptr = sources[i].as_ptr() as *const u8;
-            let (scalar_lo, scalar_hi, scalar_mid) = scalar_data[i];
+            // Load 8 u16 values from source
+            let mut src_vals: [u16; 8] = [0; 8];
+            std::ptr::copy_nonoverlapping(sources[i].as_ptr().add(offset), src_vals.as_mut_ptr(), 8);
 
-            // Load 8 u16 values
-            let src_data = _mm_loadu_si128(src_ptr.add(offset) as *const __m128i);
-
-            // Deinterleave into low and high bytes
-            let mask_lo = _mm_set1_epi16(0x00FF);
-            let src_lo = _mm_and_si128(src_data, mask_lo);
-            let src_hi = _mm_srli_epi16(src_data, 8);
-
-            // Karatsuba multiplication (simplified for now - will optimize)
-            // For correctness, do scalar multiplication per element
-            let mut temp_result: [u16; 8] = [0; 8];
-            let src_vals: [u16; 8] = std::mem::transmute(src_data);
+            // Multiply and accumulate
             for j in 0..8 {
-                temp_result[j] = gf_mul(src_vals[j], coefficients[i]);
+                acc_vals[j] ^= gf_mul(src_vals[j], coefficients[i]);
             }
-            let prod = _mm_loadu_si128(temp_result.as_ptr() as *const __m128i);
-
-            // Accumulate
-            acc = _mm_xor_si128(acc, prod);
         }
 
-        // Load destination and XOR with accumulated products
-        let dst_data = _mm_loadu_si128(dst_ptr.add(offset) as *const __m128i);
-        let result = _mm_xor_si128(dst_data, acc);
+        // Load destination, XOR with accumulated products, store
+        let mut dst_vals: [u16; 8] = [0; 8];
+        std::ptr::copy_nonoverlapping(dst.as_ptr().add(offset), dst_vals.as_mut_ptr(), 8);
 
-        _mm_storeu_si128(dst_ptr.add(offset) as *mut __m128i, result);
+        for j in 0..8 {
+            dst_vals[j] ^= acc_vals[j];
+        }
+
+        std::ptr::copy_nonoverlapping(dst_vals.as_ptr(), dst.as_mut_ptr().add(offset), 8);
     }
 
     // Handle remainder with scalar code
@@ -1006,8 +912,9 @@ unsafe fn gf_muladd_column_pclmul_x86(
     source: &[u16],
     coefficients: &[u16],
 ) {
-    static mut CALL_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    if CALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static CALL_COUNT: AtomicUsize = AtomicUsize::new(0);
+    if CALL_COUNT.fetch_add(1, Ordering::Relaxed) == 0 {
         eprintln!(
             "  ✓ Using parallel column PCLMUL x86 (destinations={}, src_len={})",
             destinations.len(),
@@ -1027,17 +934,16 @@ unsafe fn gf_muladd_column_pclmul_x86(
         assert_eq!(dst.len(), source.len());
     }
 
-    // Process 8 u16 values (16 bytes) at a time
+    // Process 8 u16 values at a time
     let chunks = source.len() / 8;
     let remainder = source.len() % 8;
 
-    let src_ptr = source.as_ptr() as *const u8;
-
     for chunk_idx in 0..chunks {
-        let offset = chunk_idx * 16;
+        let offset = chunk_idx * 8;
 
         // Load source data once
-        let src_data = _mm_loadu_si128(src_ptr.add(offset) as *const __m128i);
+        let mut src_vals: [u16; 8] = [0; 8];
+        std::ptr::copy_nonoverlapping(source.as_ptr().add(offset), src_vals.as_mut_ptr(), 8);
 
         // Process each destination
         for (i, dst) in destinations.iter_mut().enumerate() {
@@ -1045,19 +951,21 @@ unsafe fn gf_muladd_column_pclmul_x86(
                 continue;
             }
 
-            // Compute product using scalar (will optimize later)
-            let mut temp_result: [u16; 8] = [0; 8];
-            let src_vals: [u16; 8] = std::mem::transmute(src_data);
+            // Compute products
+            let mut prod_vals: [u16; 8] = [0; 8];
             for j in 0..8 {
-                temp_result[j] = gf_mul(src_vals[j], coefficients[i]);
+                prod_vals[j] = gf_mul(src_vals[j], coefficients[i]);
             }
-            let prod = _mm_loadu_si128(temp_result.as_ptr() as *const __m128i);
 
             // Load destination, XOR with product, store
-            let dst_ptr = dst.as_mut_ptr() as *mut u8;
-            let dst_data = _mm_loadu_si128(dst_ptr.add(offset) as *const __m128i);
-            let result = _mm_xor_si128(dst_data, prod);
-            _mm_storeu_si128(dst_ptr.add(offset) as *mut __m128i, result);
+            let mut dst_vals: [u16; 8] = [0; 8];
+            std::ptr::copy_nonoverlapping(dst.as_ptr().add(offset), dst_vals.as_mut_ptr(), 8);
+
+            for j in 0..8 {
+                dst_vals[j] ^= prod_vals[j];
+            }
+
+            std::ptr::copy_nonoverlapping(dst_vals.as_ptr(), dst.as_mut_ptr().add(offset), 8);
         }
     }
 
