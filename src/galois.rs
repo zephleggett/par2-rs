@@ -391,7 +391,14 @@ pub fn gf_muladd(dst: &mut [u16], src: &[u16], scalar: u16) {
 
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("pclmulqdq") && is_x86_feature_detected!("sse2") {
+        if is_x86_feature_detected!("pclmulqdq")
+            && is_x86_feature_detected!("avx2")
+            && is_x86_feature_detected!("sse4.1")
+        {
+            unsafe { gf_muladd_avx2_pclmul_x86(dst, src, scalar) };
+            return;
+        }
+        if is_x86_feature_detected!("pclmulqdq") && is_x86_feature_detected!("sse4.1") {
             unsafe { gf_muladd_pclmul_x86(dst, src, scalar) };
             return;
         }
@@ -453,7 +460,15 @@ pub fn gf_muladd_multi(dst: &mut [u16], sources: &[&[u16]], coefficients: &[u16]
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("pclmulqdq")
-            && is_x86_feature_detected!("sse2")
+            && is_x86_feature_detected!("avx2")
+            && is_x86_feature_detected!("sse4.1")
+            && sources.len() <= 8
+        {
+            unsafe { gf_muladd_multi_avx2_pclmul_x86(dst, sources, coefficients) };
+            return;
+        }
+        if is_x86_feature_detected!("pclmulqdq")
+            && is_x86_feature_detected!("sse4.1")
             && sources.len() <= 8
         {
             unsafe { gf_muladd_multi_pclmul_x86(dst, sources, coefficients) };
@@ -506,7 +521,15 @@ pub fn gf_muladd_column(destinations: &mut [&mut [u16]], source: &[u16], coeffic
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("pclmulqdq")
-            && is_x86_feature_detected!("sse2")
+            && is_x86_feature_detected!("avx2")
+            && is_x86_feature_detected!("sse4.1")
+            && destinations.len() <= 8
+        {
+            unsafe { gf_muladd_column_avx2_pclmul_x86(destinations, source, coefficients) };
+            return;
+        }
+        if is_x86_feature_detected!("pclmulqdq")
+            && is_x86_feature_detected!("sse4.1")
             && destinations.len() <= 8
         {
             unsafe { gf_muladd_column_pclmul_x86(destinations, source, coefficients) };
@@ -1020,6 +1043,63 @@ unsafe fn gf_muladd_pclmul_x86(dst: &mut [u16], src: &[u16], scalar: u16) {
     }
 }
 
+/// AVX2 PCLMULQDQ implementation for gf_muladd (256-bit, processes 16 u16 at once)
+///
+/// 2x wider than SSE version, processes 16 u16 values (32 bytes) per iteration.
+/// Available on Intel Haswell (2013+) and AMD Excavator (2015+).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "pclmulqdq,avx2,sse4.1")]
+unsafe fn gf_muladd_avx2_pclmul_x86(dst: &mut [u16], src: &[u16], scalar: u16) {
+    use std::arch::x86_64::*;
+
+    if scalar == 0 {
+        return;
+    }
+
+    let scalar_vec = _mm_set1_epi16(scalar as i16);
+
+    // Process 16 u16 values (32 bytes) at a time using two 128-bit ops
+    let chunks = dst.len().min(src.len()) / 16;
+    let remainder = dst.len().min(src.len()) % 16;
+
+    for i in 0..chunks {
+        let offset = i * 16;
+
+        // Process first 8 u16
+        let src_vec1 = _mm_loadu_si128(src.as_ptr().add(offset) as *const __m128i);
+        let prod_vec1 = gf_mul_pclmul_x86_8(src_vec1, scalar_vec);
+        let dst_vec1 = _mm_loadu_si128(dst.as_ptr().add(offset) as *const __m128i);
+        let result1 = _mm_xor_si128(dst_vec1, prod_vec1);
+        _mm_storeu_si128(dst.as_mut_ptr().add(offset) as *mut __m128i, result1);
+
+        // Process second 8 u16
+        let src_vec2 = _mm_loadu_si128(src.as_ptr().add(offset + 8) as *const __m128i);
+        let prod_vec2 = gf_mul_pclmul_x86_8(src_vec2, scalar_vec);
+        let dst_vec2 = _mm_loadu_si128(dst.as_ptr().add(offset + 8) as *const __m128i);
+        let result2 = _mm_xor_si128(dst_vec2, prod_vec2);
+        _mm_storeu_si128(dst.as_mut_ptr().add(offset + 8) as *mut __m128i, result2);
+    }
+
+    // Handle remainder with SSE
+    let start = chunks * 16;
+    if dst.len().min(src.len()) - start >= 8 {
+        let src_vec = _mm_loadu_si128(src.as_ptr().add(start) as *const __m128i);
+        let prod_vec = gf_mul_pclmul_x86_8(src_vec, scalar_vec);
+        let dst_vec = _mm_loadu_si128(dst.as_ptr().add(start) as *const __m128i);
+        let result = _mm_xor_si128(dst_vec, prod_vec);
+        _mm_storeu_si128(dst.as_mut_ptr().add(start) as *mut __m128i, result);
+
+        // Handle final <8 elements with scalar
+        for i in (start + 8)..dst.len().min(src.len()) {
+            dst[i] ^= gf_mul(src[i], scalar);
+        }
+    } else if remainder > 0 {
+        for i in start..dst.len().min(src.len()) {
+            dst[i] ^= gf_mul(src[i], scalar);
+        }
+    }
+}
+
 /// x86 PCLMULQDQ multi-region implementation
 ///
 /// Processes up to 8 source regions simultaneously, accumulating products before XORing.
@@ -1104,6 +1184,104 @@ unsafe fn gf_muladd_multi_pclmul_x86(dst: &mut [u16], sources: &[&[u16]], coeffi
     }
 }
 
+/// AVX2 PCLMULQDQ multi-region implementation (256-bit, processes 16 u16 at once)
+///
+/// 2x wider than SSE version. Processes up to 8 source regions simultaneously,
+/// accumulating products before XORing. Processes 16 u16 values (32 bytes) per iteration.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "pclmulqdq,avx2,sse4.1")]
+unsafe fn gf_muladd_multi_avx2_pclmul_x86(
+    dst: &mut [u16],
+    sources: &[&[u16]],
+    coefficients: &[u16],
+) {
+    use std::arch::x86_64::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static WARNED: AtomicUsize = AtomicUsize::new(0);
+
+    // Find minimum length
+    let min_len = sources.iter().map(|s| s.len()).min().unwrap_or(0);
+    if dst.len() < min_len && WARNED.swap(1, Ordering::Relaxed) == 0 {
+        eprintln!("Warning: dst.len()={} < min_src_len={}", dst.len(), min_len);
+    }
+
+    // Process 16 u16 values (32 bytes) at a time using two 128-bit ops
+    let chunks = dst.len().min(min_len) / 16;
+    let remainder = dst.len().min(min_len) % 16;
+
+    for chunk_idx in 0..chunks {
+        let offset = chunk_idx * 16;
+
+        // Process first 8 u16
+        let mut acc_vec1 = _mm_setzero_si128();
+        for i in 0..sources.len() {
+            if coefficients[i] == 0 {
+                continue;
+            }
+            let src_vec = _mm_loadu_si128(sources[i].as_ptr().add(offset) as *const __m128i);
+            let coeff_vec = _mm_set1_epi16(coefficients[i] as i16);
+            let prod_vec = gf_mul_pclmul_x86_8(src_vec, coeff_vec);
+            acc_vec1 = _mm_xor_si128(acc_vec1, prod_vec);
+        }
+        let dst_vec1 = _mm_loadu_si128(dst.as_ptr().add(offset) as *const __m128i);
+        let result1 = _mm_xor_si128(dst_vec1, acc_vec1);
+        _mm_storeu_si128(dst.as_mut_ptr().add(offset) as *mut __m128i, result1);
+
+        // Process second 8 u16
+        let mut acc_vec2 = _mm_setzero_si128();
+        for i in 0..sources.len() {
+            if coefficients[i] == 0 {
+                continue;
+            }
+            let src_vec = _mm_loadu_si128(sources[i].as_ptr().add(offset + 8) as *const __m128i);
+            let coeff_vec = _mm_set1_epi16(coefficients[i] as i16);
+            let prod_vec = gf_mul_pclmul_x86_8(src_vec, coeff_vec);
+            acc_vec2 = _mm_xor_si128(acc_vec2, prod_vec);
+        }
+        let dst_vec2 = _mm_loadu_si128(dst.as_ptr().add(offset + 8) as *const __m128i);
+        let result2 = _mm_xor_si128(dst_vec2, acc_vec2);
+        _mm_storeu_si128(dst.as_mut_ptr().add(offset + 8) as *mut __m128i, result2);
+    }
+
+    // Handle remainder with SSE
+    let start = chunks * 16;
+    if dst.len().min(min_len) - start >= 8 {
+        let mut acc_vec = _mm_setzero_si128();
+        for i in 0..sources.len() {
+            if coefficients[i] == 0 {
+                continue;
+            }
+            let src_vec = _mm_loadu_si128(sources[i].as_ptr().add(start) as *const __m128i);
+            let coeff_vec = _mm_set1_epi16(coefficients[i] as i16);
+            let prod_vec = gf_mul_pclmul_x86_8(src_vec, coeff_vec);
+            acc_vec = _mm_xor_si128(acc_vec, prod_vec);
+        }
+        let dst_vec = _mm_loadu_si128(dst.as_ptr().add(start) as *const __m128i);
+        let result = _mm_xor_si128(dst_vec, acc_vec);
+        _mm_storeu_si128(dst.as_mut_ptr().add(start) as *mut __m128i, result);
+
+        // Handle final <8 elements with scalar
+        let limit = dst.len().min(min_len);
+        for (i, dst_item) in dst.iter_mut().enumerate().take(limit).skip(start + 8) {
+            for j in 0..sources.len() {
+                if coefficients[j] != 0 {
+                    *dst_item ^= gf_mul(sources[j][i], coefficients[j]);
+                }
+            }
+        }
+    } else if remainder > 0 {
+        let limit = dst.len().min(min_len);
+        for (i, dst_item) in dst.iter_mut().enumerate().take(limit).skip(start) {
+            for j in 0..sources.len() {
+                if coefficients[j] != 0 {
+                    *dst_item ^= gf_mul(sources[j][i], coefficients[j]);
+                }
+            }
+        }
+    }
+}
+
 /// x86 PCLMULQDQ column implementation
 ///
 /// One source contributes to multiple destinations (transpose of multi-region).
@@ -1171,6 +1349,104 @@ unsafe fn gf_muladd_column_pclmul_x86(
     // Handle remainder with scalar code
     if remainder > 0 {
         let start = chunks * 8;
+        for (dst, &coeff) in destinations.iter_mut().zip(coefficients.iter()) {
+            if coeff != 0 {
+                for i in start..source.len() {
+                    dst[i] ^= gf_mul(source[i], coeff);
+                }
+            }
+        }
+    }
+}
+
+/// AVX2 PCLMULQDQ column implementation (256-bit, processes 16 u16 at once)
+///
+/// 2x wider than SSE version. One source contributes to multiple destinations,
+/// processing up to 8 destinations simultaneously. Processes 16 u16 values (32 bytes) per iteration.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "pclmulqdq,avx2,sse4.1")]
+unsafe fn gf_muladd_column_avx2_pclmul_x86(
+    destinations: &mut [&mut [u16]],
+    source: &[u16],
+    coefficients: &[u16],
+) {
+    use std::arch::x86_64::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static WARNED: AtomicUsize = AtomicUsize::new(0);
+
+    // Verify all destinations match source length
+    for (i, dst) in destinations.iter().enumerate() {
+        if dst.len() != source.len() && WARNED.swap(1, Ordering::Relaxed) == 0 {
+            eprintln!(
+                "Warning: destinations[{}].len()={} != source.len()={}",
+                i,
+                dst.len(),
+                source.len()
+            );
+        }
+    }
+
+    // Process 16 u16 values (32 bytes) at a time using two 128-bit ops
+    let chunks = source.len() / 16;
+    let remainder = source.len() % 16;
+
+    for chunk_idx in 0..chunks {
+        let offset = chunk_idx * 16;
+
+        // Load source data (first 8 u16)
+        let src_vec1 = _mm_loadu_si128(source.as_ptr().add(offset) as *const __m128i);
+        // Load source data (second 8 u16)
+        let src_vec2 = _mm_loadu_si128(source.as_ptr().add(offset + 8) as *const __m128i);
+
+        // Process each destination
+        for (i, dst) in destinations.iter_mut().enumerate() {
+            if coefficients[i] == 0 {
+                continue;
+            }
+
+            let coeff_vec = _mm_set1_epi16(coefficients[i] as i16);
+
+            // Process first 8 u16
+            let prod_vec1 = gf_mul_pclmul_x86_8(src_vec1, coeff_vec);
+            let dst_vec1 = _mm_loadu_si128(dst.as_ptr().add(offset) as *const __m128i);
+            let result1 = _mm_xor_si128(dst_vec1, prod_vec1);
+            _mm_storeu_si128(dst.as_mut_ptr().add(offset) as *mut __m128i, result1);
+
+            // Process second 8 u16
+            let prod_vec2 = gf_mul_pclmul_x86_8(src_vec2, coeff_vec);
+            let dst_vec2 = _mm_loadu_si128(dst.as_ptr().add(offset + 8) as *const __m128i);
+            let result2 = _mm_xor_si128(dst_vec2, prod_vec2);
+            _mm_storeu_si128(dst.as_mut_ptr().add(offset + 8) as *mut __m128i, result2);
+        }
+    }
+
+    // Handle remainder with SSE
+    let start = chunks * 16;
+    if source.len() - start >= 8 {
+        let src_vec = _mm_loadu_si128(source.as_ptr().add(start) as *const __m128i);
+
+        for (i, dst) in destinations.iter_mut().enumerate() {
+            if coefficients[i] == 0 {
+                continue;
+            }
+
+            let coeff_vec = _mm_set1_epi16(coefficients[i] as i16);
+            let prod_vec = gf_mul_pclmul_x86_8(src_vec, coeff_vec);
+            let dst_vec = _mm_loadu_si128(dst.as_ptr().add(start) as *const __m128i);
+            let result = _mm_xor_si128(dst_vec, prod_vec);
+            _mm_storeu_si128(dst.as_mut_ptr().add(start) as *mut __m128i, result);
+        }
+
+        // Handle final <8 elements with scalar
+        for (dst, &coeff) in destinations.iter_mut().zip(coefficients.iter()) {
+            if coeff != 0 {
+                for i in (start + 8)..source.len() {
+                    dst[i] ^= gf_mul(source[i], coeff);
+                }
+            }
+        }
+    } else if remainder > 0 {
         for (dst, &coeff) in destinations.iter_mut().zip(coefficients.iter()) {
             if coeff != 0 {
                 for i in start..source.len() {
