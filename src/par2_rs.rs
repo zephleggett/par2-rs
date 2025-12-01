@@ -49,7 +49,10 @@ pub struct ReconstructionTransform {
 
 /// Calculate optimal data batch size based on system characteristics
 fn optimal_data_batch_size(recovery_blocks: usize, _block_size: usize) -> usize {
-    let num_cpus = num_cpus::get();
+    // Use available_parallelism() for accurate container/cgroup detection
+    let num_cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
 
     // Target enough work per thread to amortize synchronization overhead
     // More recovery blocks = more work per data block = can use larger batches
@@ -69,7 +72,10 @@ fn optimal_data_batch_size(recovery_blocks: usize, _block_size: usize) -> usize 
 
 /// Calculate optimal recovery batch size for parallel processing
 fn optimal_recovery_batch_size(recovery_blocks: usize) -> usize {
-    let num_cpus = num_cpus::get();
+    // Use available_parallelism() for accurate container/cgroup detection
+    let num_cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
 
     // Want at least num_cpus parallel work units
     // recovery_blocks / batch_size >= num_cpus
@@ -766,7 +772,9 @@ impl Par2ReedSolomon {
             use_shuffle2x,
             data_batch_size,
             recovery_batch_size,
-            num_cpus = num_cpus::get(),
+            num_cpus = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1),
             "Created streaming encoder with adaptive batch sizes"
         );
 

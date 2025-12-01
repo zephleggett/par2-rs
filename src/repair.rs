@@ -160,7 +160,10 @@ pub fn repair_files_parallel(
     let rs = Arc::new(Par2ReedSolomon::new(total_blocks, total_recovery_count));
 
     // Chunk size for optimal balance between syscalls and parallelism
-    let num_cpus = num_cpus::get();
+    // Use available_parallelism() instead of num_cpus::get() for accurate container detection
+    let num_cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
 
     // Target chunk size to ensure good parallelism
     // Smaller chunks = more parallelism, but more overhead
@@ -289,18 +292,18 @@ pub fn repair_files_parallel(
     let est_mb_per_chunk = (blocks_loaded_per_chunk * chunk_size) / (1024 * 1024);
 
     // Adaptive parallelism based on system resources
-    // Maximum performance settings - memory usage is acceptable for modern systems
+    // Reduced multipliers to avoid over-subscription on CI/container environments
     let default_multiplier = if good_indices.len() < 100 {
-        // Sparse case: can use more parallelism
-        (num_cpus * 2).clamp(8, 20) // Scale with cores, cap at reasonable max
+        // Sparse case: moderate parallelism
+        (num_cpus * 2).clamp(4, 16)
     } else {
-        // Dense case: very aggressive for maximum speed
+        // Dense case: conservative multipliers for better scheduling
         if num_cpus >= 8 {
-            10 // High-core systems: very aggressive (4-5s repair time)
+            4 // High-core systems: moderate
         } else if num_cpus >= 4 {
-            6 // Mid-range: aggressive
+            3 // Mid-range: conservative
         } else {
-            3 // Low-core systems: moderate
+            2 // Low-core systems: minimal
         }
     };
 

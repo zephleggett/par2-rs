@@ -14,8 +14,9 @@ use crate::parser::{FileHash, FileInfo, SliceChecksum};
 use crate::volumes::{split_into_volumes, VolumeInfo, VolumeScheme};
 use crate::writer::{self, compute_file_id, compute_recovery_set_id};
 use crc32fast::Hasher as Crc32Hasher;
+use rayon::prelude::*;
 use std::fs::File;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 
 /// Calculate optimal block size based on total file size
@@ -48,6 +49,74 @@ fn calculate_block_size(total_size: u64) -> u64 {
     assert_eq!(block_size % 4, 0);
 
     block_size
+}
+
+/// Pre-computed file metadata from parallel hashing pass
+struct FileMetadata {
+    path: PathBuf,
+    full_hash: [u8; 16],
+    hash_16k: [u8; 16],
+    length: u64,
+    name: String,
+}
+
+/// Compute file hashes in parallel for all input files
+/// This is Phase 1 of creation - metadata collection is parallelized
+fn compute_file_hashes_parallel(input_files: &[PathBuf]) -> Result<Vec<FileMetadata>> {
+    use md5::{Digest, Md5};
+
+    tracing::info!(
+        num_files = input_files.len(),
+        "Computing file hashes in parallel"
+    );
+
+    input_files
+        .par_iter()
+        .map(|path| {
+            let mut file = File::open(path).map_err(|e| {
+                Par2Error::Io(std::io::Error::new(
+                    e.kind(),
+                    format!("Failed to open {}: {}", path.display(), e),
+                ))
+            })?;
+
+            let file_size = file.metadata()?.len();
+            let mut full_hash_ctx = Md5::new();
+            let mut hash_16k_ctx = Md5::new();
+            let mut bytes_hashed_16k = 0u64;
+
+            // Read file in chunks to compute hashes
+            let mut buffer = vec![0u8; 64 * 1024]; // 64KB read buffer
+            loop {
+                let bytes_read = file.read(&mut buffer)?;
+                if bytes_read == 0 {
+                    break;
+                }
+
+                full_hash_ctx.update(&buffer[..bytes_read]);
+
+                if bytes_hashed_16k < 16384 {
+                    let to_hash = bytes_read.min((16384 - bytes_hashed_16k) as usize);
+                    hash_16k_ctx.update(&buffer[..to_hash]);
+                    bytes_hashed_16k += to_hash as u64;
+                }
+            }
+
+            let name = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .ok_or_else(|| Par2Error::InvalidFormat("Invalid filename".to_string()))?
+                .to_string();
+
+            Ok(FileMetadata {
+                path: path.clone(),
+                full_hash: full_hash_ctx.finalize().into(),
+                hash_16k: hash_16k_ctx.finalize().into(),
+                length: file_size,
+                name,
+            })
+        })
+        .collect()
 }
 
 /// PAR2 file creator
@@ -138,7 +207,6 @@ impl Par2Creator {
     /// Create PAR2 files using streaming (memory-efficient)
     pub fn create(&self) -> Result<Vec<PathBuf>> {
         use md5::{Digest, Md5};
-        use std::io::Read;
 
         tracing::info!(
             input_files = self.input_files.len(),
@@ -146,11 +214,9 @@ impl Par2Creator {
             "Creating PAR2 files (streaming mode)"
         );
 
-        // Step 1: Calculate block size and count blocks
-        let mut total_size = 0u64;
-        for path in &self.input_files {
-            total_size += path.metadata()?.len();
-        }
+        // Step 1: Compute file hashes in parallel (Phase 1 optimization)
+        let file_metadata = compute_file_hashes_parallel(&self.input_files)?;
+        let total_size: u64 = file_metadata.iter().map(|m| m.length).sum();
 
         let block_size = self
             .block_size
@@ -160,9 +226,8 @@ impl Par2Creator {
         // Count total blocks across all files
         let mut num_data_blocks = 0usize;
         let mut file_block_counts = Vec::new();
-        for path in &self.input_files {
-            let file_size = path.metadata()?.len();
-            let blocks = file_size.div_ceil(block_size) as usize;
+        for meta in &file_metadata {
+            let blocks = meta.length.div_ceil(block_size) as usize;
             file_block_counts.push(blocks);
             num_data_blocks += blocks;
         }
@@ -188,27 +253,17 @@ impl Par2Creator {
             .create_streaming_encoder(num_recovery_blocks, block_size as usize, chunk_size)
             .map_err(|e| Par2Error::RepairFailed(format!("Failed to create encoder: {}", e)))?;
 
-        // Step 4: Stream through files, processing chunks and building metadata
-        tracing::info!("Processing files in streaming mode");
+        // Step 4: Stream through files, compute block checksums and encode
+        // File-level hashes already computed in parallel, just need IFSC checksums
+        tracing::info!("Processing blocks for IFSC and encoding");
         let mut file_infos = Vec::new();
         let mut slice_checksums_map = std::collections::HashMap::new();
         let mut global_block_idx = 0usize;
 
-        for (file_idx, path) in self.input_files.iter().enumerate() {
-            let mut file = File::open(path)?;
-            let file_size = file.metadata()?.len();
+        for (file_idx, meta) in file_metadata.iter().enumerate() {
+            let mut file = File::open(&meta.path)?;
+            let file_size = meta.length;
             let num_blocks = file_block_counts[file_idx];
-
-            // Initialize hashers for this file
-            let mut full_hash_ctx = Md5::new();
-            let mut hash_16k_ctx = Md5::new();
-            let mut bytes_hashed_16k = 0u64;
-
-            let name = path
-                .file_name()
-                .and_then(|s| s.to_str())
-                .ok_or_else(|| Par2Error::InvalidFormat("Invalid filename".to_string()))?
-                .to_string();
 
             let mut block_checksums = Vec::with_capacity(num_blocks);
 
@@ -224,14 +279,6 @@ impl Par2Creator {
                 // Pad block to full size if needed
                 if block_buffer.len() < block_size as usize {
                     block_buffer.resize(block_size as usize, 0);
-                }
-
-                // Update hashes
-                full_hash_ctx.update(&block_buffer[..block_actual_size]);
-                if bytes_hashed_16k < 16384 {
-                    let to_hash = block_actual_size.min(16384 - bytes_hashed_16k as usize);
-                    hash_16k_ctx.update(&block_buffer[..to_hash]);
-                    bytes_hashed_16k += to_hash as u64;
                 }
 
                 // Compute IFSC checksum for this block
@@ -260,17 +307,15 @@ impl Par2Creator {
                 global_block_idx += 1;
             }
 
-            // Finalize file hashes
-            let full_hash: [u8; 16] = full_hash_ctx.finalize().into();
-            let hash_16k: [u8; 16] = hash_16k_ctx.finalize().into();
-            let file_id = compute_file_id(&hash_16k, file_size, &name);
+            // Use pre-computed file hashes from parallel pass
+            let file_id = compute_file_id(&meta.hash_16k, file_size, &meta.name);
 
             file_infos.push(FileInfo {
                 file_id,
-                hash: full_hash,
-                hash_16k,
+                hash: meta.full_hash,
+                hash_16k: meta.hash_16k,
                 length: file_size,
-                name,
+                name: meta.name.clone(),
             });
 
             slice_checksums_map.insert(file_id, block_checksums);
