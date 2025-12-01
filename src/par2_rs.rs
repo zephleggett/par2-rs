@@ -47,8 +47,40 @@ pub struct ReconstructionTransform {
     pub vandermonde_coeffs: Vec<Vec<u16>>,
 }
 
-/// Number of data blocks to batch together for cache-efficient processing
-const DATA_BATCH_SIZE: usize = 16;
+/// Calculate optimal data batch size based on system characteristics
+fn optimal_data_batch_size(recovery_blocks: usize, _block_size: usize) -> usize {
+    let num_cpus = num_cpus::get();
+
+    // Target enough work per thread to amortize synchronization overhead
+    // More recovery blocks = more work per data block = can use larger batches
+    let base_batch = if recovery_blocks >= 100 {
+        // Many recovery blocks: larger batches for better cache locality
+        num_cpus * 8
+    } else if recovery_blocks >= 50 {
+        num_cpus * 4
+    } else {
+        // Few recovery blocks: smaller batches to maximize parallelism
+        num_cpus * 2
+    };
+
+    // Clamp to reasonable range
+    base_batch.clamp(16, 128)
+}
+
+/// Calculate optimal recovery batch size for parallel processing
+fn optimal_recovery_batch_size(recovery_blocks: usize) -> usize {
+    let num_cpus = num_cpus::get();
+
+    // Want at least num_cpus parallel work units
+    // recovery_blocks / batch_size >= num_cpus
+    // batch_size <= recovery_blocks / num_cpus
+    let max_batch = (recovery_blocks / num_cpus).max(1);
+
+    // But also want batches big enough to amortize overhead
+    // Minimum 4 recovery blocks per batch for efficiency
+    // Maximum 8 due to SIMD register constraints in gf_muladd_column
+    max_batch.clamp(4, 8)
+}
 
 /// Streaming encoder for PAR2 creation
 /// Processes data in chunks to minimize memory usage while maintaining performance
@@ -70,6 +102,10 @@ pub struct StreamingEncoder {
     batch_buffers: Vec<Vec<u16>>,
     /// Indices of data blocks currently in batch_buffers
     batch_indices: Vec<usize>,
+    /// Dynamic batch size for data blocks
+    data_batch_size: usize,
+    /// Dynamic batch size for recovery blocks
+    recovery_batch_size: usize,
 }
 
 /// PAR2 Reed-Solomon decoder
@@ -711,11 +747,15 @@ impl Par2ReedSolomon {
             }
         }
 
+        // Calculate optimal batch sizes for this system
+        let data_batch_size = optimal_data_batch_size(recovery_blocks, block_size);
+        let recovery_batch_size = optimal_recovery_batch_size(recovery_blocks);
+
         // Pre-allocate buffers for batch processing (reused to avoid allocation churn)
-        let batch_buffers: Vec<Vec<u16>> = (0..DATA_BATCH_SIZE)
+        let batch_buffers: Vec<Vec<u16>> = (0..data_batch_size)
             .map(|_| vec![0u16; symbols_per_block])
             .collect();
-        let batch_indices = Vec::with_capacity(DATA_BATCH_SIZE);
+        let batch_indices = Vec::with_capacity(data_batch_size);
 
         tracing::info!(
             data_blocks = self.data_blocks,
@@ -724,8 +764,10 @@ impl Par2ReedSolomon {
             chunk_size,
             num_chunks,
             use_shuffle2x,
-            batch_size = DATA_BATCH_SIZE,
-            "Created streaming encoder"
+            data_batch_size,
+            recovery_batch_size,
+            num_cpus = num_cpus::get(),
+            "Created streaming encoder with adaptive batch sizes"
         );
 
         Ok(StreamingEncoder {
@@ -737,6 +779,8 @@ impl Par2ReedSolomon {
             use_shuffle2x,
             batch_buffers,
             batch_indices,
+            data_batch_size,
+            recovery_batch_size,
         })
     }
 }
@@ -769,7 +813,7 @@ impl StreamingEncoder {
         self.batch_indices.push(data_block_idx);
 
         // Flush when batch is full
-        if self.batch_indices.len() >= DATA_BATCH_SIZE {
+        if self.batch_indices.len() >= self.data_batch_size {
             self.flush_batch();
         }
     }
@@ -789,21 +833,20 @@ impl StreamingEncoder {
 
         let use_shuffle2x = self.use_shuffle2x;
         let symbols_per_block = self.symbols_per_block;
-
-        // Process recovery blocks in parallel batches
-        // Each thread processes a batch of recovery blocks against ALL data blocks in our batch
-        const RECOVERY_BATCH_SIZE: usize = 8;
+        let recovery_batch_size = self.recovery_batch_size;
 
         // Get references for use in parallel closure
         let batch_indices = &self.batch_indices;
         let batch_buffers = &self.batch_buffers;
         let coeff_matrix = &self.coeff_matrix;
 
+        // Process recovery blocks in parallel batches
+        // Each thread processes a batch of recovery blocks against ALL data blocks in our batch
         self.recovery_data
-            .par_chunks_mut(RECOVERY_BATCH_SIZE)
+            .par_chunks_mut(recovery_batch_size)
             .enumerate()
             .for_each(|(batch_idx, recovery_batch)| {
-                let batch_start = batch_idx * RECOVERY_BATCH_SIZE;
+                let batch_start = batch_idx * recovery_batch_size;
 
                 // Process each data block in our batch against this recovery batch
                 for (slot, &data_idx) in batch_indices.iter().enumerate() {
