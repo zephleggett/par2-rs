@@ -417,9 +417,6 @@ impl Par2ReedSolomon {
         R: FnMut(usize, usize, usize) -> Result<Vec<u8>, String>,
         W: FnMut(usize, Vec<u8>) -> Result<(), String>,
     {
-        use std::time::Instant;
-        let start = Instant::now();
-
         let m = missing_indices.len();
         if m == 0 {
             return Ok(());
@@ -449,8 +446,6 @@ impl Par2ReedSolomon {
         let elimination_factors = &transform.elimination_factors;
         let vandermonde_coeffs = &transform.vandermonde_coeffs;
 
-        let init_start = Instant::now();
-
         let mut accumulators: Vec<Vec<u16>> = vec![vec![0u16; chunk_symbols]; m];
 
         for (original_row, &rec_idx) in present_recovery_indices.iter().take(m).enumerate() {
@@ -475,18 +470,7 @@ impl Par2ReedSolomon {
             }
         }
 
-        tracing::debug!(
-            init_ms = init_start.elapsed().as_millis(),
-            use_shuffle2x = use_shuffle2x,
-            "Accumulators initialized"
-        );
-
         // PHASE 2: Stream through present data blocks using region-batched SIMD operations
-        let stream_start = Instant::now();
-        let mut total_io_us = 0u128;
-        let mut total_conversion_us = 0u128;
-        let mut total_gf_us = 0u128;
-
         // Pre-filter present data columns to only those that are used by any missing row.
         // This can skip work if the elimination produced zeros for some columns.
         let mut used_data_cols: Vec<usize> = Vec::with_capacity(present_data_indices.len());
@@ -524,13 +508,10 @@ impl Par2ReedSolomon {
                 .iter()
                 .enumerate()
             {
-                let io_start = Instant::now();
                 let data_chunk_bytes = read_block(data_idx, chunk_offset, chunk_size)?;
-                total_io_us += io_start.elapsed().as_micros();
 
                 // Convert to u16 using SIMD and keep
                 let mut buf = vec![0u16; chunk_symbols];
-                let conv_start = Instant::now();
                 galois::bytes_to_u16_simd(&data_chunk_bytes, &mut buf);
 
                 // Convert to shuffle2x format if supported
@@ -538,7 +519,6 @@ impl Par2ReedSolomon {
                     galois::prepare_shuffle2x(&mut buf);
                 }
 
-                total_conversion_us += conv_start.elapsed().as_micros();
                 data_chunks_u16.push(buf);
                 nonzero_global_idxs.push(data_idx);
                 nonzero_local_cols.push(local_col);
@@ -567,7 +547,6 @@ impl Par2ReedSolomon {
 
             // Process all destination rows sequentially - outer parallelism handles chunk-level
             // parallelism, so nested par_chunks_mut here causes thread contention overhead
-            let gf_start = Instant::now();
 
             // Build destination refs for all rows
             let mut dst_refs: Vec<&mut [u16]> = accumulators
@@ -593,19 +572,9 @@ impl Par2ReedSolomon {
                     gf_muladd_block_regions(&mut dst_refs, &sources, &coeff_refs, chunk_symbols);
                 }
             }
-            total_gf_us += gf_start.elapsed().as_micros();
 
             batch_start_col = batch_end_col;
         }
-
-        tracing::info!(
-            stream_ms = stream_start.elapsed().as_millis(),
-            io_ms = total_io_us / 1000,
-            conversion_ms = total_conversion_us / 1000,
-            gf_ms = total_gf_us / 1000,
-            blocks_processed = used_data_cols.len(),
-            "Streaming subtraction complete"
-        );
 
         // Convert accumulators back from shuffle2x to interleaved format before Gaussian elimination
         if use_shuffle2x {
@@ -615,8 +584,6 @@ impl Par2ReedSolomon {
         }
 
         // PHASE 4: Apply pre-computed Gaussian elimination to accumulators
-        let ge_start = Instant::now();
-
         for k in 0..m {
             let pivot = scale_factors[k];
             if pivot != 1 {
@@ -656,14 +623,7 @@ impl Par2ReedSolomon {
             }
         }
 
-        tracing::debug!(
-            ge_ms = ge_start.elapsed().as_millis(),
-            "Gaussian elimination applied"
-        );
-
         // PHASE 5: Write results via callback
-        let write_start = Instant::now();
-
         for (row, &miss_idx) in missing_indices.iter().enumerate() {
             let mut output = Vec::with_capacity(chunk_size);
             for &val in &accumulators[row] {
@@ -671,12 +631,6 @@ impl Par2ReedSolomon {
             }
             write_result(miss_idx, output)?;
         }
-
-        tracing::debug!(
-            write_ms = write_start.elapsed().as_millis(),
-            total_ms = start.elapsed().as_millis(),
-            "Streaming reconstruction complete"
-        );
 
         Ok(())
     }

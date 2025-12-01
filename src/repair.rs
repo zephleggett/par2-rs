@@ -248,15 +248,11 @@ fn process_chunk(
     )
     .map_err(|e| Par2Error::RepairFailed(format!("Streaming RS reconstruction failed: {}", e)))?;
 
-    // Collect reconstructed chunks to return
-    let mut writes = Vec::new();
+    // Collect reconstructed chunks to return (use remove to avoid clone)
+    let mut writes = Vec::with_capacity(damaged_block_indices.len());
     for &damaged_idx in damaged_block_indices {
-        if let Some(reconstructed_chunk) = reconstructed_chunks.get(&damaged_idx) {
-            writes.push((
-                damaged_idx,
-                chunk_offset as u64,
-                reconstructed_chunk.clone(),
-            ));
+        if let Some(reconstructed_chunk) = reconstructed_chunks.remove(&damaged_idx) {
+            writes.push((damaged_idx, chunk_offset as u64, reconstructed_chunk));
         } else {
             return Err(Par2Error::RepairFailed(format!(
                 "BUG: Block {} was not reconstructed (chunk_offset={}, chunk_idx={})",
