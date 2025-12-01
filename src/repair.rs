@@ -96,8 +96,8 @@ fn process_chunk(
     let chunk_offset = chunk_idx * chunk_size;
     let this_chunk_size = (block_size - chunk_offset).min(chunk_size);
 
-    // Storage for reconstructed chunks
-    let mut reconstructed_chunks: HashMap<usize, Vec<u8>> = HashMap::new();
+    // Storage for reconstructed chunks - Vec instead of HashMap since write_result is called in order
+    let mut reconstructed_chunks: Vec<Vec<u8>> = Vec::with_capacity(damaged_block_indices.len());
 
     // Callback to read a block chunk on-demand
     let mut read_block = |block_idx: usize,
@@ -229,9 +229,9 @@ fn process_chunk(
         }
     };
 
-    // Callback to write reconstructed chunk
-    let mut write_result = |block_idx: usize, data: Vec<u8>| -> std::result::Result<(), String> {
-        reconstructed_chunks.insert(block_idx, data);
+    // Callback to write reconstructed chunk - called in order, so just push
+    let mut write_result = |_block_idx: usize, data: Vec<u8>| -> std::result::Result<(), String> {
+        reconstructed_chunks.push(data);
         Ok(())
     };
 
@@ -248,18 +248,22 @@ fn process_chunk(
     )
     .map_err(|e| Par2Error::RepairFailed(format!("Streaming RS reconstruction failed: {}", e)))?;
 
-    // Collect reconstructed chunks to return (use remove to avoid clone)
-    let mut writes = Vec::with_capacity(damaged_block_indices.len());
-    for &damaged_idx in damaged_block_indices {
-        if let Some(reconstructed_chunk) = reconstructed_chunks.remove(&damaged_idx) {
-            writes.push((damaged_idx, chunk_offset as u64, reconstructed_chunk));
-        } else {
-            return Err(Par2Error::RepairFailed(format!(
-                "BUG: Block {} was not reconstructed (chunk_offset={}, chunk_idx={})",
-                damaged_idx, chunk_offset, chunk_idx
-            )));
-        }
+    // Verify we got all chunks and pair with block indices
+    if reconstructed_chunks.len() != damaged_block_indices.len() {
+        return Err(Par2Error::RepairFailed(format!(
+            "Expected {} reconstructed chunks, got {} (chunk_idx={})",
+            damaged_block_indices.len(),
+            reconstructed_chunks.len(),
+            chunk_idx
+        )));
     }
+
+    // Zip with damaged indices - no HashMap lookup needed
+    let writes: Vec<_> = damaged_block_indices
+        .iter()
+        .zip(reconstructed_chunks)
+        .map(|(&idx, data)| (idx, chunk_offset as u64, data))
+        .collect();
 
     Ok(writes)
 }

@@ -473,22 +473,17 @@ impl Par2ReedSolomon {
         // PHASE 2: Stream through present data blocks using region-batched SIMD operations
         // Pre-filter present data columns to only those that are used by any missing row.
         // This can skip work if the elimination produced zeros for some columns.
-        let mut used_data_cols: Vec<usize> = Vec::with_capacity(present_data_indices.len());
+        // Store (data_idx, col_pos) tuples to avoid HashMap lookup later
+        let mut used_data_cols: Vec<(usize, usize)> =
+            Vec::with_capacity(present_data_indices.len());
         for (data_col, &data_idx) in present_data_indices.iter().enumerate() {
             let any_nz = vandermonde_coeffs
                 .iter()
                 .take(m)
                 .any(|row_coeffs| row_coeffs[data_col] != 0);
             if any_nz {
-                used_data_cols.push(data_idx);
+                used_data_cols.push((data_idx, data_col));
             }
-        }
-
-        // Build quick lookup from data index -> column position in vandermonde_coeffs
-        let mut data_col_pos: std::collections::HashMap<usize, usize> =
-            std::collections::HashMap::with_capacity(present_data_indices.len());
-        for (col_pos, &data_idx) in present_data_indices.iter().enumerate() {
-            data_col_pos.insert(data_idx, col_pos);
         }
 
         // Process sources in batches to maximize cache/SIMD reuse
@@ -502,12 +497,9 @@ impl Par2ReedSolomon {
 
             // Read batch of sources; do not perform zero-detection (include all)
             data_chunks_u16.clear();
-            let mut nonzero_global_idxs: Vec<usize> = Vec::with_capacity(batch_len);
-            let mut nonzero_local_cols: Vec<usize> = Vec::with_capacity(batch_len);
-            for (local_col, &data_idx) in used_data_cols[batch_start_col..batch_end_col]
-                .iter()
-                .enumerate()
-            {
+            // Store col_pos for each item in this batch (avoids HashMap lookup)
+            let mut batch_col_positions: Vec<usize> = Vec::with_capacity(batch_len);
+            for &(data_idx, col_pos) in &used_data_cols[batch_start_col..batch_end_col] {
                 let data_chunk_bytes = read_block(data_idx, chunk_offset, chunk_size)?;
 
                 // Convert to u16 using SIMD and keep
@@ -520,8 +512,7 @@ impl Par2ReedSolomon {
                 }
 
                 data_chunks_u16.push(buf);
-                nonzero_global_idxs.push(data_idx);
-                nonzero_local_cols.push(local_col);
+                batch_col_positions.push(col_pos);
             }
 
             // Build region inputs
@@ -533,13 +524,9 @@ impl Par2ReedSolomon {
             // Coefficients matrix per destination row for this batch
             let mut coeff_rows: Vec<Vec<u16>> = Vec::with_capacity(m);
             for vand_row in vandermonde_coeffs.iter().take(m) {
-                let mut row_coeffs = Vec::with_capacity(nonzero_global_idxs.len());
-                for &global_idx in &nonzero_global_idxs {
-                    if let Some(&col_pos) = data_col_pos.get(&global_idx) {
-                        row_coeffs.push(vand_row[col_pos]);
-                    } else {
-                        row_coeffs.push(0);
-                    }
+                let mut row_coeffs = Vec::with_capacity(batch_col_positions.len());
+                for &col_pos in &batch_col_positions {
+                    row_coeffs.push(vand_row[col_pos]);
                 }
                 coeff_rows.push(row_coeffs);
             }
