@@ -534,119 +534,131 @@ pub fn repair_files_parallel(
         num_chunks
     );
 
-    // Process ALL chunks in a single parallel phase with static distribution
-    // This minimizes synchronization overhead (single sync point at scope exit)
+    // Hybrid approach: mega-batches with rayon::scope inside each
+    // This enables I/O pipelining (write batch N while computing batch N+1)
+    // while keeping synchronization overhead low (~10 sync points vs hundreds)
     let num_threads = rayon::current_num_threads();
-    let chunks_per_thread = num_chunks.div_ceil(num_threads);
+
+    // Mega-batch size: large enough to amortize sync overhead, small enough for I/O pipelining
+    // Target: ~10-20 batches total for good pipelining without excessive sync
+    let mega_batch_size = (num_chunks / 10).max(num_threads * 4).min(num_chunks);
 
     tracing::debug!(
         num_chunks,
         num_threads,
-        chunks_per_thread,
-        "Static work distribution for parallel repair"
+        mega_batch_size,
+        num_batches = num_chunks.div_ceil(mega_batch_size),
+        "Mega-batch configuration for parallel repair"
     );
 
-    // Pre-allocate result storage - one slot per chunk
-    // Using UnsafeCell because each thread writes to disjoint indices (no data races)
-    let results: Vec<UnsafeCell<Option<Result<Vec<(usize, u64, Vec<u8>)>>>>> =
-        (0..num_chunks).map(|_| UnsafeCell::new(None)).collect();
-
-    // SAFETY: Each thread writes to a disjoint range of indices, so no data races
-    // The UnsafeCell is only accessed by one thread at a time for each index
-    struct ResultsWrapper<'a>(&'a [UnsafeCell<Option<Result<Vec<(usize, u64, Vec<u8>)>>>>]);
-    unsafe impl<'a> Sync for ResultsWrapper<'a> {}
-
-    let results_wrapper = ResultsWrapper(&results);
-
-    // Single parallel phase - each thread gets exactly one task with a contiguous range
-    rayon::scope(|s| {
-        for thread_id in 0..num_threads {
-            let start = thread_id * chunks_per_thread;
-            let end = (start + chunks_per_thread).min(num_chunks);
-
-            if start >= num_chunks {
-                break; // No more work for this thread
-            }
-
-            // Borrow all the data we need (rayon::scope allows this)
-            let block_to_file = &block_to_file;
-            let file_paths = &file_paths;
-            let input_files = &input_files;
-            let recovery_blocks = &recovery_blocks;
-            let recovery_file_handles = &recovery_file_handles;
-            let rs = &rs;
-            let damaged_block_indices = &damaged_block_indices;
-            let good_indices = &good_indices;
-            let present_recovery_indices = &present_recovery_indices;
-            let transform = &transform;
-            let results_wrapper = &results_wrapper;
-
-            s.spawn(move |_| {
-                for chunk_idx in start..end {
-                    let result = process_chunk(
-                        chunk_idx,
-                        chunk_size,
-                        block_size,
-                        total_blocks,
-                        block_to_file,
-                        file_paths,
-                        input_files,
-                        recovery_blocks,
-                        recovery_file_handles,
-                        rs,
-                        damaged_block_indices,
-                        good_indices,
-                        present_recovery_indices,
-                        transform,
-                    );
-                    // SAFETY: Each thread writes to disjoint indices
-                    unsafe {
-                        *results_wrapper.0[chunk_idx].get() = Some(result);
-                    }
-                }
-            });
-        }
-    }); // Single synchronization point here
-
-    // Collect all results and write to files (sequential - I/O bound anyway)
     let mut total_writes = 0;
-    for chunk_idx in 0..num_chunks {
-        // SAFETY: All threads have completed at this point
-        let chunk_result = unsafe { (*results[chunk_idx].get()).take() }.ok_or_else(|| {
-            Par2Error::RepairFailed(format!("Chunk {} was not processed", chunk_idx))
-        })?;
 
-        for (block_idx, chunk_offset, data) in chunk_result? {
-            if let Some(&(file_id, block_in_file)) = block_to_file.get(&block_idx) {
-                if let Some(file) = output_files.get_mut(&file_id) {
-                    if let Some(file_info) = file_map.get(&file_id) {
-                        let block_byte_offset = (block_in_file * block_size) as u64;
-                        let write_offset = block_byte_offset + chunk_offset;
+    for batch_start in (0..num_chunks).step_by(mega_batch_size) {
+        let batch_end = (batch_start + mega_batch_size).min(num_chunks);
+        let batch_len = batch_end - batch_start;
 
-                        file.seek(SeekFrom::Start(write_offset))?;
+        // Pre-allocate result storage for this batch only (bounded memory)
+        let results: Vec<UnsafeCell<Option<Result<Vec<(usize, u64, Vec<u8>)>>>>> =
+            (0..batch_len).map(|_| UnsafeCell::new(None)).collect();
 
-                        let file_remaining = file_info.length.saturating_sub(write_offset);
-                        let bytes_to_write = (data.len() as u64).min(file_remaining) as usize;
+        // SAFETY: Each thread writes to disjoint indices within this batch
+        struct ResultsWrapper<'a>(&'a [UnsafeCell<Option<Result<Vec<(usize, u64, Vec<u8>)>>>>]);
+        unsafe impl<'a> Sync for ResultsWrapper<'a> {}
+        let results_wrapper = ResultsWrapper(&results);
 
-                        if bytes_to_write > 0 {
-                            file.write_all(&data[..bytes_to_write])?;
-                            total_writes += 1;
+        // Static distribution within mega-batch
+        let chunks_per_thread = batch_len.div_ceil(num_threads);
+
+        rayon::scope(|s| {
+            for thread_id in 0..num_threads {
+                let start = thread_id * chunks_per_thread;
+                let end = (start + chunks_per_thread).min(batch_len);
+
+                if start >= batch_len {
+                    break;
+                }
+
+                // Borrow all the data we need (rayon::scope allows this)
+                let block_to_file = &block_to_file;
+                let file_paths = &file_paths;
+                let input_files = &input_files;
+                let recovery_blocks = &recovery_blocks;
+                let recovery_file_handles = &recovery_file_handles;
+                let rs = &rs;
+                let damaged_block_indices = &damaged_block_indices;
+                let good_indices = &good_indices;
+                let present_recovery_indices = &present_recovery_indices;
+                let transform = &transform;
+                let results_wrapper = &results_wrapper;
+
+                s.spawn(move |_| {
+                    for local_idx in start..end {
+                        let chunk_idx = batch_start + local_idx;
+                        let result = process_chunk(
+                            chunk_idx,
+                            chunk_size,
+                            block_size,
+                            total_blocks,
+                            block_to_file,
+                            file_paths,
+                            input_files,
+                            recovery_blocks,
+                            recovery_file_handles,
+                            rs,
+                            damaged_block_indices,
+                            good_indices,
+                            present_recovery_indices,
+                            transform,
+                        );
+                        // SAFETY: Each thread writes to disjoint indices
+                        unsafe {
+                            *results_wrapper.0[local_idx].get() = Some(result);
+                        }
+                    }
+                });
+            }
+        }); // Sync point per mega-batch (only ~10 total)
+
+        // Write results from this batch immediately (enables I/O pipelining)
+        for local_idx in 0..batch_len {
+            let chunk_result = unsafe { (*results[local_idx].get()).take() }.ok_or_else(|| {
+                Par2Error::RepairFailed(format!(
+                    "Chunk {} was not processed",
+                    batch_start + local_idx
+                ))
+            })?;
+
+            for (block_idx, chunk_offset, data) in chunk_result? {
+                if let Some(&(file_id, block_in_file)) = block_to_file.get(&block_idx) {
+                    if let Some(file) = output_files.get_mut(&file_id) {
+                        if let Some(file_info) = file_map.get(&file_id) {
+                            let block_byte_offset = (block_in_file * block_size) as u64;
+                            let write_offset = block_byte_offset + chunk_offset;
+
+                            file.seek(SeekFrom::Start(write_offset))?;
+
+                            let file_remaining = file_info.length.saturating_sub(write_offset);
+                            let bytes_to_write = (data.len() as u64).min(file_remaining) as usize;
+
+                            if bytes_to_write > 0 {
+                                file.write_all(&data[..bytes_to_write])?;
+                                total_writes += 1;
+                            }
                         }
                     }
                 }
             }
         }
 
-        // Progress tracking every 10%
-        if chunk_idx % (num_chunks / 10).max(1) == 0 {
-            tracing::debug!(
-                completed = chunk_idx + 1,
-                total = num_chunks,
-                progress_pct = ((chunk_idx + 1) * 100) / num_chunks,
-                total_writes,
-                "Processing chunks"
-            );
-        }
+        // Progress tracking per mega-batch
+        tracing::debug!(
+            batch_start,
+            batch_end,
+            total = num_chunks,
+            progress_pct = (batch_end * 100) / num_chunks,
+            total_writes,
+            "Completed mega-batch"
+        );
     }
 
     // Verify chunks were written (note: total_writes may be less than theoretical max due to partial last blocks)
