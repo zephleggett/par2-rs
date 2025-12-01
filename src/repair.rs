@@ -9,11 +9,10 @@
 //!
 //! # Performance Tuning
 //!
-//! Environment variables for tuning:
+//! Environment variables for tuning (usually not needed):
 //! - `PAR2_PARALLELISM`: Multiplier for parallel chunk count (default: auto)
 //! - `PAR2_MAX_PARALLEL_CHUNKS`: Hard cap on parallel chunks
 //! - `PAR2_MIN_CHUNK`: Minimum chunk size in bytes (default: 64KB)
-//! - `PAR2_CPU_HEAVY`: Set to "1" for CPU-bound workloads
 //!
 //! # Related Modules
 //!
@@ -336,20 +335,8 @@ pub fn repair_files_parallel(
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(memory_limit_chunks);
 
-    // Limit batch size to prevent I/O thrashing
-    // Each parallel chunk reads ~1800 blocks, so too much parallelism causes disk contention
-    // Use num_cpus for I/O-heavy workloads (many blocks per chunk)
-    // Allow override that this workload is CPU heavy and safe to push parallel chunks
-    let cpu_heavy = std::env::var("PAR2_CPU_HEAVY")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-    let io_limit = if cpu_heavy {
-        (num_cpus * parallelism_multiplier).max(num_cpus)
-    } else if blocks_loaded_per_chunk > 100 {
-        num_cpus // I/O bound: limit to CPU count
-    } else {
-        num_cpus * parallelism_multiplier // CPU bound: allow more parallelism
-    };
+    // Maximum parallelism - modern SSDs handle concurrent reads well
+    let io_limit = (num_cpus * parallelism_multiplier).max(num_cpus);
 
     let mut batch_size = io_limit.max(4).min(max_parallel).min(num_chunks);
 
