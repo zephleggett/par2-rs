@@ -42,6 +42,53 @@ use std::cell::RefCell;
 
 use std::cell::UnsafeCell;
 
+/// Get effective CPU count, accounting for container limits (cgroups)
+/// This is important for CI runners where available_parallelism() returns host CPUs
+fn get_effective_cpus() -> usize {
+    // First try cgroups v2 (modern containers)
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(content) = std::fs::read_to_string("/sys/fs/cgroup/cpu.max") {
+            let parts: Vec<&str> = content.trim().split_whitespace().collect();
+            if parts.len() >= 2 {
+                if let (Ok(quota), Ok(period)) = (parts[0].parse::<i64>(), parts[1].parse::<i64>())
+                {
+                    if quota > 0 && period > 0 {
+                        let cpus = ((quota as f64) / (period as f64)).ceil() as usize;
+                        if cpus > 0 {
+                            tracing::debug!(quota, period, cpus, "Detected cgroups v2 CPU limit");
+                            return cpus.max(1);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Try cgroups v1 (older containers)
+        if let (Ok(quota), Ok(period)) = (
+            std::fs::read_to_string("/sys/fs/cgroup/cpu/cpu.cfs_quota_us"),
+            std::fs::read_to_string("/sys/fs/cgroup/cpu/cpu.cfs_period_us"),
+        ) {
+            if let (Ok(quota), Ok(period)) =
+                (quota.trim().parse::<i64>(), period.trim().parse::<i64>())
+            {
+                if quota > 0 && period > 0 {
+                    let cpus = ((quota as f64) / (period as f64)).ceil() as usize;
+                    if cpus > 0 {
+                        tracing::debug!(quota, period, cpus, "Detected cgroups v1 CPU limit");
+                        return cpus.max(1);
+                    }
+                }
+            }
+        }
+    }
+
+    // Fall back to standard detection
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+}
+
 /// Type alias for chunk write operations: (block_idx, chunk_offset, data)
 type ChunkWrites = Vec<(usize, u64, Vec<u8>)>;
 
@@ -381,10 +428,8 @@ pub fn repair_files_parallel(
     let rs = Arc::new(Par2ReedSolomon::new(total_blocks, total_recovery_count));
 
     // Chunk size for optimal balance between syscalls and parallelism
-    // Use available_parallelism() instead of num_cpus::get() for accurate container detection
-    let num_cpus = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
+    // Use container-aware CPU detection (cgroups on Linux, available_parallelism elsewhere)
+    let num_cpus = get_effective_cpus();
 
     // Target chunk size to ensure good parallelism
     // Smaller chunks = more parallelism, but more overhead
@@ -544,7 +589,8 @@ pub fn repair_files_parallel(
     // Hybrid approach: mega-batches with rayon::scope inside each
     // This enables I/O pipelining (write batch N while computing batch N+1)
     // while keeping synchronization overhead low (~10 sync points vs hundreds)
-    let num_threads = rayon::current_num_threads();
+    // Use container-aware CPU count for thread distribution
+    let num_threads = get_effective_cpus();
 
     // Mega-batch size: large enough to amortize sync overhead, small enough for I/O pipelining
     // Target: ~10-20 batches total for good pipelining without excessive sync
