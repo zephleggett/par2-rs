@@ -565,48 +565,34 @@ impl Par2ReedSolomon {
             }
             // coeff_rows are consumed below via slices per row-chunk; no separate refs needed here.
 
-            // Parallelize across destination rows: split into row-chunks
-            // This exploits multiple CPU cores without write contention.
+            // Process all destination rows sequentially - outer parallelism handles chunk-level
+            // parallelism, so nested par_chunks_mut here causes thread contention overhead
             let gf_start = Instant::now();
-            let rows_per_task = 32usize; // tuned; small enough to balance, large enough to amortize overhead
-            accumulators
-                .par_chunks_mut(rows_per_task)
-                .enumerate()
-                .for_each(|(chunk_idx, acc_chunk)| {
-                    let row_start = chunk_idx * rows_per_task;
-                    let row_end = row_start + acc_chunk.len();
 
-                    // Build local destination refs for this row slice
-                    let mut dst_refs: Vec<&mut [u16]> =
-                        acc_chunk.iter_mut().map(|row| row.as_mut_slice()).collect();
+            // Build destination refs for all rows
+            let mut dst_refs: Vec<&mut [u16]> = accumulators
+                .iter_mut()
+                .map(|row| row.as_mut_slice())
+                .collect();
 
-                    // Local coefficient refs for this row slice
-                    let coeff_refs_local: Vec<&[u16]> = coeff_rows[row_start..row_end]
-                        .iter()
-                        .map(|r| r.as_slice())
-                        .collect();
+            // Build coefficient refs for all rows
+            let coeff_refs: Vec<&[u16]> = coeff_rows.iter().map(|r| r.as_slice()).collect();
 
-                    // Perform cache-optimized region processing
-                    // Automatically subdivides into 128KB regions for L2 cache efficiency
-                    if !sources.is_empty() {
-                        if use_shuffle2x {
-                            // Use faster shuffle2x path (~55% faster on x86 AVX2)
-                            gf_muladd_block_regions_shuffle2x(
-                                &mut dst_refs,
-                                &sources,
-                                &coeff_refs_local,
-                                chunk_symbols,
-                            );
-                        } else {
-                            gf_muladd_block_regions(
-                                &mut dst_refs,
-                                &sources,
-                                &coeff_refs_local,
-                                chunk_symbols,
-                            );
-                        }
-                    }
-                });
+            // Perform cache-optimized region processing
+            // Automatically subdivides into 128KB regions for L2 cache efficiency
+            if !sources.is_empty() {
+                if use_shuffle2x {
+                    // Use faster shuffle2x path (~55% faster on x86 AVX2)
+                    gf_muladd_block_regions_shuffle2x(
+                        &mut dst_refs,
+                        &sources,
+                        &coeff_refs,
+                        chunk_symbols,
+                    );
+                } else {
+                    gf_muladd_block_regions(&mut dst_refs, &sources, &coeff_refs, chunk_symbols);
+                }
+            }
             total_gf_us += gf_start.elapsed().as_micros();
 
             batch_start_col = batch_end_col;
