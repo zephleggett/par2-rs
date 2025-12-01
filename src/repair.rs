@@ -111,7 +111,7 @@ fn get_effective_cpus_internal() -> usize {
     #[cfg(target_os = "linux")]
     {
         if let Ok(content) = std::fs::read_to_string("/sys/fs/cgroup/cpu.max") {
-            let parts: Vec<&str> = content.trim().split_whitespace().collect();
+            let parts: Vec<&str> = content.split_whitespace().collect();
             if parts.len() >= 2 {
                 if let (Ok(quota), Ok(period)) = (parts[0].parse::<i64>(), parts[1].parse::<i64>())
                 {
