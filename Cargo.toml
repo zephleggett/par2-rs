@@ -25,8 +25,6 @@ rayon = "1.10"
 thiserror = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-crossbeam = "0.8"
-sysinfo = "0.30"
 
 [dev-dependencies]
 tempfile = "3.23"

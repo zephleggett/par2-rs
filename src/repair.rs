@@ -25,7 +25,6 @@ use super::verify::VerificationResult;
 use super::{Par2Operation, ProgressCallback};
 use crate::error::{Par2Error, Result};
 use crate::par2_rs::Par2ReedSolomon;
-use rayon::prelude::*;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 #[cfg(not(unix))]
@@ -35,16 +34,235 @@ use std::io::{Seek, SeekFrom, Write};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use sysinfo::System;
 
 // Thread-local file handle cache for Windows
 // Each rayon worker thread gets its own cache to avoid contention
 #[cfg(not(unix))]
 use std::cell::RefCell;
 
+use std::cell::UnsafeCell;
+
 #[cfg(not(unix))]
 thread_local! {
     static FILE_HANDLE_CACHE: RefCell<HashMap<PathBuf, File>> = RefCell::new(HashMap::new());
+}
+
+// Thread-local buffer pool to reduce allocations in hot paths
+// Each thread gets its own pool to avoid contention
+thread_local! {
+    static BUFFER_POOL: UnsafeCell<Vec<Vec<u8>>> = const { UnsafeCell::new(Vec::new()) };
+}
+
+/// Get a buffer from the thread-local pool, or allocate a new one
+/// The buffer is guaranteed to have at least `size` capacity
+fn get_pooled_buffer(size: usize) -> Vec<u8> {
+    BUFFER_POOL.with(|pool| {
+        // SAFETY: We're the only thread accessing this pool
+        let pool = unsafe { &mut *pool.get() };
+        if let Some(mut buf) = pool.pop() {
+            if buf.capacity() >= size {
+                buf.clear();
+                buf.resize(size, 0);
+                return buf;
+            }
+            // Buffer too small, drop it and allocate new
+        }
+        vec![0u8; size]
+    })
+}
+
+/// Process a single chunk of repair data
+/// Extracted for use with static thread pool
+#[allow(clippy::too_many_arguments)]
+fn process_chunk(
+    chunk_idx: usize,
+    chunk_size: usize,
+    block_size: usize,
+    total_blocks: usize,
+    block_to_file: &HashMap<usize, (FileHash, usize)>,
+    _file_paths: &HashMap<FileHash, PathBuf>,
+    input_files: &HashMap<FileHash, File>,
+    recovery_blocks: &[crate::parser::RecoveryBlock],
+    recovery_file_handles: &HashMap<PathBuf, File>,
+    rs: &Par2ReedSolomon,
+    damaged_block_indices: &[usize],
+    good_indices: &[usize],
+    present_recovery_indices: &[usize],
+    transform: &crate::par2_rs::ReconstructionTransform,
+) -> Result<Vec<(usize, u64, Vec<u8>)>> {
+    let chunk_offset = chunk_idx * chunk_size;
+    let this_chunk_size = (block_size - chunk_offset).min(chunk_size);
+
+    // Storage for reconstructed chunks
+    let mut reconstructed_chunks: HashMap<usize, Vec<u8>> = HashMap::new();
+
+    // Callback to read a block chunk on-demand
+    let mut read_block = |block_idx: usize,
+                          offset: usize,
+                          size: usize|
+     -> std::result::Result<Vec<u8>, String> {
+        if block_idx < total_blocks {
+            // Data block - read from file
+            if let Some(&(file_id, block_in_file)) = block_to_file.get(&block_idx) {
+                let block_byte_offset = (block_in_file * block_size) as u64;
+                let chunk_byte_offset = block_byte_offset + offset as u64;
+                let mut buffer = get_pooled_buffer(size);
+
+                #[cfg(unix)]
+                {
+                    let file = input_files
+                        .get(&file_id)
+                        .ok_or_else(|| "Input file handle not found".to_string())?;
+                    match FileExt::read_at(file, &mut buffer, chunk_byte_offset) {
+                        Ok(bytes_read) => {
+                            if bytes_read < size {
+                                buffer[bytes_read..].fill(0);
+                            }
+                            Ok(buffer)
+                        }
+                        Err(err) => Err(format!("Read failed: {}", err)),
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    let file_path = file_paths
+                        .get(&file_id)
+                        .ok_or_else(|| "File ID not found in file_paths map".to_string())?;
+
+                    FILE_HANDLE_CACHE.with(|cache| {
+                        let mut cache = cache.borrow_mut();
+                        if !cache.contains_key(file_path) {
+                            match File::open(file_path) {
+                                Ok(f) => {
+                                    cache.insert(file_path.clone(), f);
+                                }
+                                Err(e) => return Err(format!("File open failed: {}", e)),
+                            }
+                        }
+                        let file = cache.get_mut(file_path).unwrap();
+                        file.seek(SeekFrom::Start(chunk_byte_offset))
+                            .map_err(|err| format!("Seek failed: {}", err))?;
+                        let bytes_read = file
+                            .read(&mut buffer)
+                            .map_err(|err| format!("Read failed: {}", err))?;
+                        if bytes_read < size {
+                            buffer[bytes_read..].fill(0);
+                        }
+                        Ok(buffer)
+                    })
+                }
+            } else {
+                Err(format!(
+                    "Block {} not found in block_to_file map",
+                    block_idx
+                ))
+            }
+        } else {
+            // Recovery block
+            let rec_idx = block_idx - total_blocks;
+            if rec_idx < recovery_blocks.len() {
+                let rec_block = &recovery_blocks[rec_idx];
+
+                if let Some(ref data) = rec_block.data {
+                    let start = offset.min(data.len());
+                    let end = (offset + size).min(data.len());
+                    let mut chunk = data[start..end].to_vec();
+                    chunk.resize(size, 0);
+                    return Ok(chunk);
+                }
+
+                let read_offset = rec_block.data_offset + offset as u64;
+                let bytes_to_read =
+                    size.min((rec_block.data_length as usize).saturating_sub(offset));
+                let mut buffer = get_pooled_buffer(size);
+
+                #[cfg(unix)]
+                {
+                    if let Some(file) = recovery_file_handles.get(&rec_block.file_path) {
+                        match FileExt::read_at(file, &mut buffer[..bytes_to_read], read_offset) {
+                            Ok(bytes_read) => {
+                                if bytes_read < bytes_to_read {
+                                    buffer[bytes_read..].fill(0);
+                                }
+                            }
+                            Err(err) => return Err(format!("Recovery read_at failed: {}", err)),
+                        }
+                        Ok(buffer)
+                    } else {
+                        let mut chunk = rec_block
+                            .read_chunk(offset, size)
+                            .map_err(|err| format!("Recovery block read failed: {}", err))?;
+                        chunk.resize(size, 0);
+                        Ok(chunk)
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    FILE_HANDLE_CACHE.with(|cache| {
+                        let mut cache = cache.borrow_mut();
+                        if !cache.contains_key(&rec_block.file_path) {
+                            match File::open(&rec_block.file_path) {
+                                Ok(f) => {
+                                    cache.insert(rec_block.file_path.clone(), f);
+                                }
+                                Err(e) => return Err(format!("Recovery file open failed: {}", e)),
+                            }
+                        }
+                        let file = cache.get_mut(&rec_block.file_path).unwrap();
+                        file.seek(SeekFrom::Start(read_offset))
+                            .map_err(|err| format!("Recovery seek failed: {}", err))?;
+                        let bytes_read = file
+                            .read(&mut buffer[..bytes_to_read])
+                            .map_err(|err| format!("Recovery read failed: {}", err))?;
+                        if bytes_read < bytes_to_read {
+                            buffer[bytes_read..].fill(0);
+                        }
+                        Ok(buffer)
+                    })
+                }
+            } else {
+                Err(format!("Recovery block {} out of range", rec_idx))
+            }
+        }
+    };
+
+    // Callback to write reconstructed chunk
+    let mut write_result = |block_idx: usize, data: Vec<u8>| -> std::result::Result<(), String> {
+        reconstructed_chunks.insert(block_idx, data);
+        Ok(())
+    };
+
+    // Call streaming reconstruction with precomputed transformation
+    rs.reconstruct_streaming_chunk(
+        damaged_block_indices,
+        good_indices,
+        present_recovery_indices,
+        transform,
+        chunk_offset,
+        this_chunk_size,
+        &mut read_block,
+        &mut write_result,
+    )
+    .map_err(|e| Par2Error::RepairFailed(format!("Streaming RS reconstruction failed: {}", e)))?;
+
+    // Collect reconstructed chunks to return
+    let mut writes = Vec::new();
+    for &damaged_idx in damaged_block_indices {
+        if let Some(reconstructed_chunk) = reconstructed_chunks.get(&damaged_idx) {
+            writes.push((
+                damaged_idx,
+                chunk_offset as u64,
+                reconstructed_chunk.clone(),
+            ));
+        } else {
+            return Err(Par2Error::RepairFailed(format!(
+                "BUG: Block {} was not reconstructed (chunk_offset={}, chunk_idx={})",
+                damaged_idx, chunk_offset, chunk_idx
+            )));
+        }
+    }
+
+    Ok(writes)
 }
 
 /// Parallel repair with optimal CPU utilization
@@ -285,90 +503,14 @@ pub fn repair_files_parallel(
         }
     }
 
-    // Adaptive parallelism based on data density and memory constraints
-    // Calculate estimated memory per parallel chunk
-    let blocks_loaded_per_chunk =
-        good_indices.len() + damaged_block_indices.len().min(recovery_blocks.len());
-    let est_mb_per_chunk = (blocks_loaded_per_chunk * chunk_size) / (1024 * 1024);
-
-    // Adaptive parallelism based on system resources
-    // With accurate core detection from available_parallelism(), we can use
-    // aggressive multipliers without over-subscribing
-    let default_multiplier = if good_indices.len() < 100 {
-        // Sparse case: can use more parallelism
-        (num_cpus * 2).clamp(8, 20)
-    } else {
-        // Dense case: aggressive for maximum speed
-        if num_cpus >= 8 {
-            10 // High-core systems: very aggressive
-        } else if num_cpus >= 4 {
-            6 // Mid-range: aggressive
-        } else {
-            4 // Low-core systems: still aggressive since cores are accurate
-        }
-    };
-
-    // Memory-aware maximum parallel chunks - query actual system RAM
-    // Use 50% of available memory, clamped to reasonable bounds
-    let memory_budget_mb = {
-        let sys = System::new_all();
-        let available_mb = (sys.available_memory() / (1024 * 1024)) as usize;
-        // Use 50% of available RAM, with floor of 512MB and ceiling of 8GB
-        // This is conservative since our estimates are ~3x actual usage
-        let budget = (available_mb * 50 / 100).clamp(512, 8000);
-        tracing::debug!(available_mb, budget_mb = budget, "System memory detection");
-        budget
-    };
-
-    let memory_limit_chunks = if est_mb_per_chunk > 10 {
-        // Allow maximum parallelism - estimates are conservative (3× actual usage)
-        (memory_budget_mb / est_mb_per_chunk).max(num_cpus)
-    } else {
-        // Sparse case: scale with cores very aggressively
-        num_cpus * (if num_cpus >= 8 { 8 } else { 6 })
-    };
-
-    let parallelism_multiplier = std::env::var("PAR2_PARALLELISM")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(default_multiplier);
-
-    // Allow memory limit override: PAR2_MAX_PARALLEL_CHUNKS
-    let max_parallel = std::env::var("PAR2_MAX_PARALLEL_CHUNKS")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(memory_limit_chunks);
-
-    // Maximum parallelism - modern SSDs handle concurrent reads well
-    let io_limit = (num_cpus * parallelism_multiplier).max(num_cpus);
-
-    let mut batch_size = io_limit.max(4).min(max_parallel).min(num_chunks);
-
-    // Optional override to force a specific number of parallel chunks
-    if let Ok(forced) = std::env::var("PAR2_FORCE_BATCH_SIZE") {
-        if let Ok(val) = forced.parse::<usize>() {
-            let clamped = val.clamp(1, num_chunks);
-            if clamped != batch_size {
-                tracing::info!(
-                    requested = val,
-                    applied = clamped,
-                    prev = batch_size,
-                    "Overriding batch_size via PAR2_FORCE_BATCH_SIZE"
-                );
-                batch_size = clamped;
-            }
-        }
-    }
-
+    // Log system info for debugging (no longer used for batch sizing)
     tracing::info!(
         num_cpus,
-        parallelism_multiplier,
-        memory_budget_mb,
-        est_mb_per_chunk,
-        memory_limit_chunks,
-        batch_size,
-        blocks_per_chunk = blocks_loaded_per_chunk,
-        "Adaptive parallelism configured for system"
+        num_chunks,
+        chunk_size,
+        damaged_blocks = damaged_block_indices.len(),
+        recovery_blocks = recovery_blocks.len(),
+        "Parallel repair configuration"
     );
 
     // Prepare indices for streaming API
@@ -392,235 +534,115 @@ pub fn repair_files_parallel(
         num_chunks
     );
 
-    let mut total_writes = 0;
-    for batch_start in (0..num_chunks).step_by(batch_size) {
-        let batch_end = (batch_start + batch_size).min(num_chunks);
+    // Process ALL chunks in a single parallel phase with static distribution
+    // This minimizes synchronization overhead (single sync point at scope exit)
+    let num_threads = rayon::current_num_threads();
+    let chunks_per_thread = num_chunks.div_ceil(num_threads);
 
-        tracing::debug!(batch_start, batch_end, num_chunks, "Processing chunk batch");
+    tracing::debug!(
+        num_chunks,
+        num_threads,
+        chunks_per_thread,
+        "Static work distribution for parallel repair"
+    );
 
-        // Process this batch of chunks in parallel using STREAMING API
-        let batch_writes: Result<Vec<_>> = (batch_start..batch_end)
-            .into_par_iter()
-            .map(|chunk_idx| -> Result<Vec<(usize, u64, Vec<u8>)>> {
-        let chunk_offset = chunk_idx * chunk_size;
-        let this_chunk_size = (block_size - chunk_offset).min(chunk_size);
+    // Pre-allocate result storage - one slot per chunk
+    // Using UnsafeCell because each thread writes to disjoint indices (no data races)
+    let results: Vec<UnsafeCell<Option<Result<Vec<(usize, u64, Vec<u8>)>>>>> =
+        (0..num_chunks).map(|_| UnsafeCell::new(None)).collect();
 
-        // Storage for reconstructed chunks
-        let mut reconstructed_chunks: HashMap<usize, Vec<u8>> = HashMap::new();
+    // SAFETY: Each thread writes to a disjoint range of indices, so no data races
+    // The UnsafeCell is only accessed by one thread at a time for each index
+    struct ResultsWrapper<'a>(&'a [UnsafeCell<Option<Result<Vec<(usize, u64, Vec<u8>)>>>>]);
+    unsafe impl<'a> Sync for ResultsWrapper<'a> {}
 
-        // Callback to read a block chunk on-demand
-        // Use read_at on pre-opened handles (Unix) to avoid per-read open/seek/close overhead
-        let mut read_block = |block_idx: usize, offset: usize, size: usize| -> std::result::Result<Vec<u8>, String> {
-            // Check if it's a data block or recovery block
-            if block_idx < total_blocks {
-                // Data block - read from file
-                if let Some(&(file_id, block_in_file)) = block_to_file.get(&block_idx) {
-                    let block_byte_offset = (block_in_file * block_size) as u64;
-                    let chunk_byte_offset = block_byte_offset + offset as u64;
-                    let mut buffer = vec![0u8; size];
+    let results_wrapper = ResultsWrapper(&results);
 
-                    #[cfg(unix)]
-                    {
-                        // Unix: use read_at with pre-opened file handles
-                        let file = input_files
-                            .get(&file_id)
-                            .ok_or_else(|| "Input file handle not found".to_string())?;
-                        match FileExt::read_at(file, &mut buffer, chunk_byte_offset) {
-                            Ok(bytes_read) => {
-                                if bytes_read < size {
-                                    buffer[bytes_read..].fill(0);
-                                }
-                                Ok(buffer)
-                            }
-                            Err(err) => Err(format!("Read failed: {}", err)),
-                        }
-                    }
-                    #[cfg(not(unix))]
-                    {
-                        // Non-Unix: use thread-local cache to avoid opening files repeatedly
-                        let file_path = file_paths
-                            .get(&file_id)
-                            .ok_or_else(|| "File ID not found in file_paths map".to_string())?;
+    // Single parallel phase - each thread gets exactly one task with a contiguous range
+    rayon::scope(|s| {
+        for thread_id in 0..num_threads {
+            let start = thread_id * chunks_per_thread;
+            let end = (start + chunks_per_thread).min(num_chunks);
 
-                        FILE_HANDLE_CACHE.with(|cache| {
-                            let mut cache = cache.borrow_mut();
-                            // Get or insert file handle
-                            if !cache.contains_key(file_path) {
-                                match File::open(file_path) {
-                                    Ok(f) => { cache.insert(file_path.clone(), f); }
-                                    Err(e) => return Err(format!("File open failed: {}", e)),
-                                }
-                            }
-                            let file = cache.get_mut(file_path).unwrap();
-                            file.seek(SeekFrom::Start(chunk_byte_offset))
-                                .map_err(|err| format!("Seek failed: {}", err))?;
-                            let bytes_read = file
-                                .read(&mut buffer)
-                                .map_err(|err| format!("Read failed: {}", err))?;
-                            if bytes_read < size {
-                                buffer[bytes_read..].fill(0);
-                            }
-                            Ok(buffer)
-                        })
-                    }
-                } else {
-                    Err(format!("Block {} not found in block_to_file map", block_idx))
-                }
-            } else {
-                // Recovery block - use pre-opened handles for efficiency
-                let rec_idx = block_idx - total_blocks;
-                if rec_idx < recovery_blocks.len() {
-                    let rec_block = &recovery_blocks[rec_idx];
-
-                    // Check if in-memory data exists (for PAR2 creation scenario)
-                    if let Some(ref data) = rec_block.data {
-                        let start = offset.min(data.len());
-                        let end = (offset + size).min(data.len());
-                        let mut chunk = data[start..end].to_vec();
-                        chunk.resize(size, 0);
-                        return Ok(chunk);
-                    }
-
-                    // File-backed recovery block - use pre-opened handles
-                    let read_offset = rec_block.data_offset + offset as u64;
-                    let bytes_to_read = size.min((rec_block.data_length as usize).saturating_sub(offset));
-                    let mut buffer = vec![0u8; size];
-
-                    #[cfg(unix)]
-                    {
-                        // Unix: use read_at with pre-opened file handles
-                        if let Some(file) = recovery_file_handles.get(&rec_block.file_path) {
-                            match FileExt::read_at(file, &mut buffer[..bytes_to_read], read_offset) {
-                                Ok(bytes_read) => {
-                                    if bytes_read < bytes_to_read {
-                                        buffer[bytes_read..].fill(0);
-                                    }
-                                }
-                                Err(err) => return Err(format!("Recovery read_at failed: {}", err)),
-                            }
-                            Ok(buffer)
-                        } else {
-                            // Fallback to read_chunk if handle wasn't pre-opened
-                            let mut chunk = rec_block.read_chunk(offset, size)
-                                .map_err(|err| format!("Recovery block read failed: {}", err))?;
-                            chunk.resize(size, 0);
-                            Ok(chunk)
-                        }
-                    }
-                    #[cfg(not(unix))]
-                    {
-                        // Non-Unix: use thread-local cache for recovery files
-                        FILE_HANDLE_CACHE.with(|cache| {
-                            let mut cache = cache.borrow_mut();
-                            if !cache.contains_key(&rec_block.file_path) {
-                                match File::open(&rec_block.file_path) {
-                                    Ok(f) => { cache.insert(rec_block.file_path.clone(), f); }
-                                    Err(e) => return Err(format!("Recovery file open failed: {}", e)),
-                                }
-                            }
-                            let file = cache.get_mut(&rec_block.file_path).unwrap();
-                            file.seek(SeekFrom::Start(read_offset))
-                                .map_err(|err| format!("Recovery seek failed: {}", err))?;
-                            let bytes_read = file.read(&mut buffer[..bytes_to_read])
-                                .map_err(|err| format!("Recovery read failed: {}", err))?;
-                            if bytes_read < bytes_to_read {
-                                buffer[bytes_read..].fill(0);
-                            }
-                            Ok(buffer)
-                        })
-                    }
-                } else {
-                    Err(format!("Recovery block {} out of range", rec_idx))
-                }
+            if start >= num_chunks {
+                break; // No more work for this thread
             }
-        };
 
-        // Callback to write reconstructed chunk
-        let mut write_result = |block_idx: usize, data: Vec<u8>| -> std::result::Result<(), String> {
-            reconstructed_chunks.insert(block_idx, data);
-            Ok(())
-        };
+            // Borrow all the data we need (rayon::scope allows this)
+            let block_to_file = &block_to_file;
+            let file_paths = &file_paths;
+            let input_files = &input_files;
+            let recovery_blocks = &recovery_blocks;
+            let recovery_file_handles = &recovery_file_handles;
+            let rs = &rs;
+            let damaged_block_indices = &damaged_block_indices;
+            let good_indices = &good_indices;
+            let present_recovery_indices = &present_recovery_indices;
+            let transform = &transform;
+            let results_wrapper = &results_wrapper;
 
-        // Call streaming reconstruction with precomputed transformation
-        rs.reconstruct_streaming_chunk(
-            &damaged_block_indices,
-            &good_indices,
-            &present_recovery_indices,
-            &transform,
-            chunk_offset,
-            this_chunk_size,
-            &mut read_block,
-            &mut write_result,
-        )
-        .map_err(|e| Par2Error::RepairFailed(format!("Streaming RS reconstruction failed: {}", e)))?;
-
-        // Collect reconstructed chunks to return
-        let mut writes = Vec::new();
-        for &damaged_idx in &damaged_block_indices {
-            if let Some(reconstructed_chunk) = reconstructed_chunks.get(&damaged_idx) {
-                writes.push((damaged_idx, chunk_offset as u64, reconstructed_chunk.clone()));
-            } else {
-                return Err(Par2Error::RepairFailed(format!(
-                    "BUG: Block {} was not reconstructed by RS but no error was returned (chunk_offset={}, chunk_idx={})",
-                    damaged_idx, chunk_offset, chunk_idx
-                )));
-            }
-        }
-
-        Ok(writes)
-            })
-            .collect();
-
-        // Write all chunks from this batch
-        for chunk_writes in batch_writes? {
-            for (block_idx, chunk_offset, data) in chunk_writes {
-                if let Some(&(file_id, block_in_file)) = block_to_file.get(&block_idx) {
-                    if let Some(file) = output_files.get_mut(&file_id) {
-                        if let Some(file_info) = file_map.get(&file_id) {
-                            let block_byte_offset = (block_in_file * block_size) as u64;
-                            let write_offset = block_byte_offset + chunk_offset;
-
-                            file.seek(SeekFrom::Start(write_offset))?;
-
-                            let file_remaining = file_info.length.saturating_sub(write_offset);
-                            let bytes_to_write = (data.len() as u64).min(file_remaining) as usize;
-
-                            if bytes_to_write > 0 {
-                                file.write_all(&data[..bytes_to_write])?;
-                                total_writes += 1;
-                            } else {
-                                tracing::warn!(
-                                    block_idx,
-                                    chunk_offset,
-                                    data_len = data.len(),
-                                    file_remaining,
-                                    "Skipped write: bytes_to_write = 0"
-                                );
-                            }
-                        } else {
-                            tracing::error!(
-                                block_idx,
-                                "Skipped write: file_info not found in file_map"
-                            );
-                        }
-                    } else {
-                        tracing::error!(block_idx, "Skipped write: file not found in output_files");
-                    }
-                } else {
-                    tracing::error!(
-                        block_idx,
-                        "Skipped write: block_idx not found in block_to_file"
+            s.spawn(move |_| {
+                for chunk_idx in start..end {
+                    let result = process_chunk(
+                        chunk_idx,
+                        chunk_size,
+                        block_size,
+                        total_blocks,
+                        block_to_file,
+                        file_paths,
+                        input_files,
+                        recovery_blocks,
+                        recovery_file_handles,
+                        rs,
+                        damaged_block_indices,
+                        good_indices,
+                        present_recovery_indices,
+                        transform,
                     );
+                    // SAFETY: Each thread writes to disjoint indices
+                    unsafe {
+                        *results_wrapper.0[chunk_idx].get() = Some(result);
+                    }
+                }
+            });
+        }
+    }); // Single synchronization point here
+
+    // Collect all results and write to files (sequential - I/O bound anyway)
+    let mut total_writes = 0;
+    for chunk_idx in 0..num_chunks {
+        // SAFETY: All threads have completed at this point
+        let chunk_result = unsafe { (*results[chunk_idx].get()).take() }.ok_or_else(|| {
+            Par2Error::RepairFailed(format!("Chunk {} was not processed", chunk_idx))
+        })?;
+
+        for (block_idx, chunk_offset, data) in chunk_result? {
+            if let Some(&(file_id, block_in_file)) = block_to_file.get(&block_idx) {
+                if let Some(file) = output_files.get_mut(&file_id) {
+                    if let Some(file_info) = file_map.get(&file_id) {
+                        let block_byte_offset = (block_in_file * block_size) as u64;
+                        let write_offset = block_byte_offset + chunk_offset;
+
+                        file.seek(SeekFrom::Start(write_offset))?;
+
+                        let file_remaining = file_info.length.saturating_sub(write_offset);
+                        let bytes_to_write = (data.len() as u64).min(file_remaining) as usize;
+
+                        if bytes_to_write > 0 {
+                            file.write_all(&data[..bytes_to_write])?;
+                            total_writes += 1;
+                        }
+                    }
                 }
             }
         }
 
-        // Progress tracking
-        if batch_end % 10 == 0 || batch_end == num_chunks {
+        // Progress tracking every 10%
+        if chunk_idx % (num_chunks / 10).max(1) == 0 {
             tracing::debug!(
-                completed = batch_end,
+                completed = chunk_idx + 1,
                 total = num_chunks,
-                progress_pct = (batch_end * 100) / num_chunks,
+                progress_pct = ((chunk_idx + 1) * 100) / num_chunks,
                 total_writes,
                 "Processing chunks"
             );
