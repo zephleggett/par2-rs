@@ -110,6 +110,43 @@ format_time() {
     printf "%.2fs" "$seconds"
 }
 
+# Function to format memory (input in KB)
+format_mem() {
+    local kb=$1
+    if [ "$kb" -ge 1048576 ]; then
+        printf "%.1fGB" "$(echo "scale=1; $kb / 1048576" | bc)"
+    elif [ "$kb" -ge 1024 ]; then
+        printf "%.1fMB" "$(echo "scale=1; $kb / 1024" | bc)"
+    else
+        printf "%dKB" "$kb"
+    fi
+}
+
+# Function to run command and capture time + peak memory
+# Usage: run_timed CMD_ARRAY -> sets TIME_RESULT and MEM_RESULT (KB)
+run_timed() {
+    local time_file=$(mktemp)
+    local start end
+    start=$(date +%s.%N)
+
+    if [ "$OS" = "Darwin" ]; then
+        # macOS: /usr/bin/time -l reports bytes
+        /usr/bin/time -l "$@" 2>"$time_file" >/dev/null
+        end=$(date +%s.%N)
+        # Extract "maximum resident set size" (in bytes on macOS)
+        local mem_bytes=$(grep "maximum resident set size" "$time_file" | awk '{print $1}')
+        MEM_RESULT=$((mem_bytes / 1024))
+    else
+        # Linux: /usr/bin/time -v reports KB
+        /usr/bin/time -v "$@" 2>"$time_file" >/dev/null
+        end=$(date +%s.%N)
+        MEM_RESULT=$(grep "Maximum resident set size" "$time_file" | awk '{print $NF}')
+    fi
+
+    TIME_RESULT=$(echo "$end - $start" | bc)
+    rm -f "$time_file"
+}
+
 # Benchmark creation with both tools
 echo -e "${BLUE}=== Creation Benchmark ===${NC}"
 echo ""
@@ -120,24 +157,22 @@ cp testfile.bin testfile.bin.par2rs
 
 # Benchmark creation with par2cmdline-turbo
 echo -e "${YELLOW}par2cmdline-turbo: Creating PAR2 files (10% redundancy)...${NC}"
-TURBO_CREATE_START=$(date +%s.%N)
-./par2 c -r10 -q testfile.bin.turbo.par2 testfile.bin.turbo > /dev/null 2>&1
-TURBO_CREATE_END=$(date +%s.%N)
-TURBO_CREATE_TIME=$(echo "$TURBO_CREATE_END - $TURBO_CREATE_START" | bc)
+run_timed ./par2 c -r10 -q testfile.bin.turbo.par2 testfile.bin.turbo
+TURBO_CREATE_TIME=$TIME_RESULT
+TURBO_CREATE_MEM=$MEM_RESULT
 
 TURBO_PAR2_SIZE=$(du -sh testfile.bin.turbo.par2 | cut -f1)
-echo -e "${GREEN}✓ Completed in $(format_time $TURBO_CREATE_TIME) (PAR2 size: $TURBO_PAR2_SIZE)${NC}"
+echo -e "${GREEN}✓ $(format_time $TURBO_CREATE_TIME), $(format_mem $TURBO_CREATE_MEM) peak (PAR2: $TURBO_PAR2_SIZE)${NC}"
 echo ""
 
 # Benchmark creation with par2-rs
 echo -e "${YELLOW}par2-rs: Creating PAR2 files (10% redundancy)...${NC}"
-PAR2RS_CREATE_START=$(date +%s.%N)
-"$PAR2_RS_CREATE" --redundancy 10 --output testfile.bin.par2rs.par2 testfile.bin.par2rs > /dev/null 2>&1
-PAR2RS_CREATE_END=$(date +%s.%N)
-PAR2RS_CREATE_TIME=$(echo "$PAR2RS_CREATE_END - $PAR2RS_CREATE_START" | bc)
+run_timed "$PAR2_RS_CREATE" --redundancy 10 --output testfile.bin.par2rs.par2 testfile.bin.par2rs
+PAR2RS_CREATE_TIME=$TIME_RESULT
+PAR2RS_CREATE_MEM=$MEM_RESULT
 
 PAR2RS_PAR2_SIZE=$(du -sh testfile.bin.par2rs.par2 | cut -f1)
-echo -e "${GREEN}✓ Completed in $(format_time $PAR2RS_CREATE_TIME) (PAR2 size: $PAR2RS_PAR2_SIZE)${NC}"
+echo -e "${GREEN}✓ $(format_time $PAR2RS_CREATE_TIME), $(format_mem $PAR2RS_CREATE_MEM) peak (PAR2: $PAR2RS_PAR2_SIZE)${NC}"
 echo ""
 
 # Calculate speedup
@@ -155,19 +190,17 @@ echo -e "${BLUE}=== Verification Benchmark (clean file) ===${NC}"
 echo ""
 
 echo -e "${YELLOW}par2cmdline-turbo: Verifying file...${NC}"
-TURBO_VERIFY_START=$(date +%s.%N)
-./par2 v -q testfile.bin.turbo.par2 > /dev/null 2>&1
-TURBO_VERIFY_END=$(date +%s.%N)
-TURBO_VERIFY_TIME=$(echo "$TURBO_VERIFY_END - $TURBO_VERIFY_START" | bc)
-echo -e "${GREEN}✓ Completed in $(format_time $TURBO_VERIFY_TIME)${NC}"
+run_timed ./par2 v -q testfile.bin.turbo.par2
+TURBO_VERIFY_TIME=$TIME_RESULT
+TURBO_VERIFY_MEM=$MEM_RESULT
+echo -e "${GREEN}✓ $(format_time $TURBO_VERIFY_TIME), $(format_mem $TURBO_VERIFY_MEM) peak${NC}"
 echo ""
 
 echo -e "${YELLOW}par2-rs: Verifying file...${NC}"
-PAR2RS_VERIFY_START=$(date +%s.%N)
-"$PAR2_RS_REPAIR" testfile.bin.par2rs.par2 > /dev/null 2>&1
-PAR2RS_VERIFY_END=$(date +%s.%N)
-PAR2RS_VERIFY_TIME=$(echo "$PAR2RS_VERIFY_END - $PAR2RS_VERIFY_START" | bc)
-echo -e "${GREEN}✓ Completed in $(format_time $PAR2RS_VERIFY_TIME)${NC}"
+run_timed "$PAR2_RS_REPAIR" testfile.bin.par2rs.par2
+PAR2RS_VERIFY_TIME=$TIME_RESULT
+PAR2RS_VERIFY_MEM=$MEM_RESULT
+echo -e "${GREEN}✓ $(format_time $PAR2RS_VERIFY_TIME), $(format_mem $PAR2RS_VERIFY_MEM) peak${NC}"
 echo ""
 
 # Calculate speedup
@@ -196,11 +229,10 @@ echo ""
 
 # Benchmark repair with par2cmdline-turbo
 echo -e "${YELLOW}par2cmdline-turbo: Repairing file...${NC}"
-TURBO_REPAIR_START=$(date +%s.%N)
-./par2 r -q testfile.bin.turbo.par2 > /dev/null 2>&1
-TURBO_REPAIR_END=$(date +%s.%N)
-TURBO_REPAIR_TIME=$(echo "$TURBO_REPAIR_END - $TURBO_REPAIR_START" | bc)
-echo -e "${GREEN}✓ Completed in $(format_time $TURBO_REPAIR_TIME)${NC}"
+run_timed ./par2 r -q testfile.bin.turbo.par2
+TURBO_REPAIR_TIME=$TIME_RESULT
+TURBO_REPAIR_MEM=$MEM_RESULT
+echo -e "${GREEN}✓ $(format_time $TURBO_REPAIR_TIME), $(format_mem $TURBO_REPAIR_MEM) peak${NC}"
 
 # Verify MD5 hash after turbo repair
 if [ "$OS" = "Darwin" ]; then
@@ -219,11 +251,10 @@ echo ""
 
 # Benchmark repair with par2-rs
 echo -e "${YELLOW}par2-rs: Repairing file...${NC}"
-PAR2RS_REPAIR_START=$(date +%s.%N)
-"$PAR2_RS_REPAIR" testfile.bin.par2rs.par2 > /dev/null 2>&1
-PAR2RS_REPAIR_END=$(date +%s.%N)
-PAR2RS_REPAIR_TIME=$(echo "$PAR2RS_REPAIR_END - $PAR2RS_REPAIR_START" | bc)
-echo -e "${GREEN}✓ Completed in $(format_time $PAR2RS_REPAIR_TIME)${NC}"
+run_timed "$PAR2_RS_REPAIR" testfile.bin.par2rs.par2
+PAR2RS_REPAIR_TIME=$TIME_RESULT
+PAR2RS_REPAIR_MEM=$MEM_RESULT
+echo -e "${GREEN}✓ $(format_time $PAR2RS_REPAIR_TIME), $(format_mem $PAR2RS_REPAIR_MEM) peak${NC}"
 
 # Verify MD5 hash after par2-rs repair
 if [ "$OS" = "Darwin" ]; then
@@ -253,11 +284,14 @@ echo ""
 # Summary table
 echo -e "${BLUE}=== Summary ===${NC}"
 echo ""
-printf "%-25s %-15s %-15s %-15s\n" "Operation" "par2cmdline-turbo" "par2-rs" "Speedup"
-printf "%-25s %-15s %-15s %-15s\n" "-------------------------" "---------------" "---------------" "---------------"
-printf "%-25s %-15s %-15s %-15s\n" "Create (1GB, 10% red.)" "$(format_time $TURBO_CREATE_TIME)" "$(format_time $PAR2RS_CREATE_TIME)" "${CREATE_SPEEDUP}x"
-printf "%-25s %-15s %-15s %-15s\n" "Verify (1GB, clean)" "$(format_time $TURBO_VERIFY_TIME)" "$(format_time $PAR2RS_VERIFY_TIME)" "${VERIFY_SPEEDUP}x"
-printf "%-25s %-15s %-15s %-15s\n" "Repair (100MB corrupt)" "$(format_time $TURBO_REPAIR_TIME)" "$(format_time $PAR2RS_REPAIR_TIME)" "${REPAIR_SPEEDUP}x"
+printf "%-22s %-18s %-18s %-10s\n" "Operation" "par2cmdline-turbo" "par2-rs" "Speedup"
+printf "%-22s %-18s %-18s %-10s\n" "----------------------" "------------------" "------------------" "----------"
+printf "%-22s %-18s %-18s %-10s\n" "Create (time)" "$(format_time $TURBO_CREATE_TIME)" "$(format_time $PAR2RS_CREATE_TIME)" "${CREATE_SPEEDUP}x"
+printf "%-22s %-18s %-18s %-10s\n" "Create (memory)" "$(format_mem $TURBO_CREATE_MEM)" "$(format_mem $PAR2RS_CREATE_MEM)" ""
+printf "%-22s %-18s %-18s %-10s\n" "Verify (time)" "$(format_time $TURBO_VERIFY_TIME)" "$(format_time $PAR2RS_VERIFY_TIME)" "${VERIFY_SPEEDUP}x"
+printf "%-22s %-18s %-18s %-10s\n" "Verify (memory)" "$(format_mem $TURBO_VERIFY_MEM)" "$(format_mem $PAR2RS_VERIFY_MEM)" ""
+printf "%-22s %-18s %-18s %-10s\n" "Repair (time)" "$(format_time $TURBO_REPAIR_TIME)" "$(format_time $PAR2RS_REPAIR_TIME)" "${REPAIR_SPEEDUP}x"
+printf "%-22s %-18s %-18s %-10s\n" "Repair (memory)" "$(format_mem $TURBO_REPAIR_MEM)" "$(format_mem $PAR2RS_REPAIR_MEM)" ""
 echo ""
 
 # Save results to file for artifact upload
@@ -269,19 +303,19 @@ Platform: $PLATFORM $ARCH
 Date: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
 Original File MD5: $ORIGINAL_MD5
 
-Creation Benchmark (1GB file, 10% redundancy):
-  par2cmdline-turbo: $(format_time $TURBO_CREATE_TIME)
-  par2-rs:           $(format_time $PAR2RS_CREATE_TIME)
+Creation (1GB file, 10% redundancy):
+  par2cmdline-turbo: $(format_time $TURBO_CREATE_TIME), $(format_mem $TURBO_CREATE_MEM) peak
+  par2-rs:           $(format_time $PAR2RS_CREATE_TIME), $(format_mem $PAR2RS_CREATE_MEM) peak
   Speedup:           ${CREATE_SPEEDUP}x
 
-Verification Benchmark (1GB file, clean):
-  par2cmdline-turbo: $(format_time $TURBO_VERIFY_TIME)
-  par2-rs:           $(format_time $PAR2RS_VERIFY_TIME)
+Verification (1GB file, clean):
+  par2cmdline-turbo: $(format_time $TURBO_VERIFY_TIME), $(format_mem $TURBO_VERIFY_MEM) peak
+  par2-rs:           $(format_time $PAR2RS_VERIFY_TIME), $(format_mem $PAR2RS_VERIFY_MEM) peak
   Speedup:           ${VERIFY_SPEEDUP}x
 
-Repair Benchmark (100MB corrupted):
-  par2cmdline-turbo: $(format_time $TURBO_REPAIR_TIME)
-  par2-rs:           $(format_time $PAR2RS_REPAIR_TIME)
+Repair (100MB corrupted):
+  par2cmdline-turbo: $(format_time $TURBO_REPAIR_TIME), $(format_mem $TURBO_REPAIR_MEM) peak
+  par2-rs:           $(format_time $PAR2RS_REPAIR_TIME), $(format_mem $PAR2RS_REPAIR_MEM) peak
   Speedup:           ${REPAIR_SPEEDUP}x
 
 MD5 Verification:
@@ -296,12 +330,18 @@ echo ""
 if [ -n "$GITHUB_OUTPUT" ]; then
     echo "turbo_create_time=$TURBO_CREATE_TIME" >> "$GITHUB_OUTPUT"
     echo "par2rs_create_time=$PAR2RS_CREATE_TIME" >> "$GITHUB_OUTPUT"
+    echo "turbo_create_mem=$TURBO_CREATE_MEM" >> "$GITHUB_OUTPUT"
+    echo "par2rs_create_mem=$PAR2RS_CREATE_MEM" >> "$GITHUB_OUTPUT"
     echo "create_speedup=$CREATE_SPEEDUP" >> "$GITHUB_OUTPUT"
     echo "turbo_verify_time=$TURBO_VERIFY_TIME" >> "$GITHUB_OUTPUT"
     echo "par2rs_verify_time=$PAR2RS_VERIFY_TIME" >> "$GITHUB_OUTPUT"
+    echo "turbo_verify_mem=$TURBO_VERIFY_MEM" >> "$GITHUB_OUTPUT"
+    echo "par2rs_verify_mem=$PAR2RS_VERIFY_MEM" >> "$GITHUB_OUTPUT"
     echo "verify_speedup=$VERIFY_SPEEDUP" >> "$GITHUB_OUTPUT"
     echo "turbo_repair_time=$TURBO_REPAIR_TIME" >> "$GITHUB_OUTPUT"
     echo "par2rs_repair_time=$PAR2RS_REPAIR_TIME" >> "$GITHUB_OUTPUT"
+    echo "turbo_repair_mem=$TURBO_REPAIR_MEM" >> "$GITHUB_OUTPUT"
+    echo "par2rs_repair_mem=$PAR2RS_REPAIR_MEM" >> "$GITHUB_OUTPUT"
     echo "repair_speedup=$REPAIR_SPEEDUP" >> "$GITHUB_OUTPUT"
     echo "original_md5=$ORIGINAL_MD5" >> "$GITHUB_OUTPUT"
     echo "results_file=$RESULTS_FILE" >> "$GITHUB_OUTPUT"

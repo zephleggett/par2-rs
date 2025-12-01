@@ -60,13 +60,35 @@ jobs:
       - name: Display results as step summary
         if: always()
         run: |
+          # Helper to format KB to human readable
+          format_mem() {
+            local kb=$1
+            if [ "$kb" -ge 1048576 ]; then
+              printf "%.1fGB" "$(echo "scale=1; $kb / 1048576" | bc)"
+            elif [ "$kb" -ge 1024 ]; then
+              printf "%.0fMB" "$(echo "scale=0; $kb / 1024" | bc)"
+            else
+              printf "%dKB" "$kb"
+            fi
+          }
+
+          TURBO_CREATE_MEM=$(format_mem ${{ steps.benchmark.outputs.turbo_create_mem }})
+          PAR2RS_CREATE_MEM=$(format_mem ${{ steps.benchmark.outputs.par2rs_create_mem }})
+          TURBO_VERIFY_MEM=$(format_mem ${{ steps.benchmark.outputs.turbo_verify_mem }})
+          PAR2RS_VERIFY_MEM=$(format_mem ${{ steps.benchmark.outputs.par2rs_verify_mem }})
+          TURBO_REPAIR_MEM=$(format_mem ${{ steps.benchmark.outputs.turbo_repair_mem }})
+          PAR2RS_REPAIR_MEM=$(format_mem ${{ steps.benchmark.outputs.par2rs_repair_mem }})
+
           echo "## Benchmark (${{ steps.benchmark.outputs.platform }})" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Operation | par2cmdline-turbo | par2-rs | Speedup |" >> $GITHUB_STEP_SUMMARY
           echo "|-----------|-------------------|---------|---------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Create (1GB, 10% red) | ${{ steps.benchmark.outputs.turbo_create_time }}s | ${{ steps.benchmark.outputs.par2rs_create_time }}s | .${{ steps.benchmark.outputs.create_speedup }}x |" >> $GITHUB_STEP_SUMMARY
-          echo "| Verify (1GB) | ${{ steps.benchmark.outputs.turbo_verify_time }}s | ${{ steps.benchmark.outputs.par2rs_verify_time }}s | ${{ steps.benchmark.outputs.verify_speedup }}x |" >> $GITHUB_STEP_SUMMARY
-          echo "| Repair (100MB corrupt) | ${{ steps.benchmark.outputs.turbo_repair_time }}s | ${{ steps.benchmark.outputs.par2rs_repair_time }}s | .${{ steps.benchmark.outputs.repair_speedup }}x |" >> $GITHUB_STEP_SUMMARY
+          echo "| Create (time) | ${{ steps.benchmark.outputs.turbo_create_time }}s | ${{ steps.benchmark.outputs.par2rs_create_time }}s | ${{ steps.benchmark.outputs.create_speedup }}x |" >> $GITHUB_STEP_SUMMARY
+          echo "| Create (memory) | ${TURBO_CREATE_MEM} | ${PAR2RS_CREATE_MEM} | - |" >> $GITHUB_STEP_SUMMARY
+          echo "| Verify (time) | ${{ steps.benchmark.outputs.turbo_verify_time }}s | ${{ steps.benchmark.outputs.par2rs_verify_time }}s | ${{ steps.benchmark.outputs.verify_speedup }}x |" >> $GITHUB_STEP_SUMMARY
+          echo "| Verify (memory) | ${TURBO_VERIFY_MEM} | ${PAR2RS_VERIFY_MEM} | - |" >> $GITHUB_STEP_SUMMARY
+          echo "| Repair (time) | ${{ steps.benchmark.outputs.turbo_repair_time }}s | ${{ steps.benchmark.outputs.par2rs_repair_time }}s | ${{ steps.benchmark.outputs.repair_speedup }}x |" >> $GITHUB_STEP_SUMMARY
+          echo "| Repair (memory) | ${TURBO_REPAIR_MEM} | ${PAR2RS_REPAIR_MEM} | - |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "MD5: \`${{ steps.benchmark.outputs.original_md5 }}\` (verified)" >> $GITHUB_STEP_SUMMARY
 
@@ -92,22 +114,36 @@ jobs:
         with:
           script: |
             const platform = '${{ steps.benchmark.outputs.platform }}';
-
-            const comment = `## Benchmark (${platform})
-
-            | Operation | par2cmdline-turbo | par2-rs | Speedup |
-            |-----------|-------------------|---------|---------|
-            | Create (1GB, 10% red) | ${{ steps.benchmark.outputs.turbo_create_time }}s | ${{ steps.benchmark.outputs.par2rs_create_time }}s | .${{ steps.benchmark.outputs.create_speedup }}x |
-            | Verify (1GB) | ${{ steps.benchmark.outputs.turbo_verify_time }}s | ${{ steps.benchmark.outputs.par2rs_verify_time }}s | ${{ steps.benchmark.outputs.verify_speedup }}x |
-            | Repair (100MB corrupt) | ${{ steps.benchmark.outputs.turbo_repair_time }}s | ${{ steps.benchmark.outputs.par2rs_repair_time }}s | .${{ steps.benchmark.outputs.repair_speedup }}x |
-
-            MD5: \`${{ steps.benchmark.outputs.original_md5 }}\` (verified)`;
-
+            function formatMem(kb) {
+              if (kb >= 1048576) return (kb / 1048576).toFixed(1) + 'GB';
+              if (kb >= 1024) return Math.round(kb / 1024) + 'MB';
+              return kb + 'KB';
+            }
+            const tcm = formatMem(${{ steps.benchmark.outputs.turbo_create_mem }});
+            const pcm = formatMem(${{ steps.benchmark.outputs.par2rs_create_mem }});
+            const tvm = formatMem(${{ steps.benchmark.outputs.turbo_verify_mem }});
+            const pvm = formatMem(${{ steps.benchmark.outputs.par2rs_verify_mem }});
+            const trm = formatMem(${{ steps.benchmark.outputs.turbo_repair_mem }});
+            const prm = formatMem(${{ steps.benchmark.outputs.par2rs_repair_mem }});
+            const lines = [
+              '## Benchmark (' + platform + ')',
+              '',
+              '| Operation | par2cmdline-turbo | par2-rs | Speedup |',
+              '|-----------|-------------------|---------|---------|',
+              '| Create (time) | ${{ steps.benchmark.outputs.turbo_create_time }}s | ${{ steps.benchmark.outputs.par2rs_create_time }}s | ${{ steps.benchmark.outputs.create_speedup }}x |',
+              '| Create (memory) | ' + tcm + ' | ' + pcm + ' | - |',
+              '| Verify (time) | ${{ steps.benchmark.outputs.turbo_verify_time }}s | ${{ steps.benchmark.outputs.par2rs_verify_time }}s | ${{ steps.benchmark.outputs.verify_speedup }}x |',
+              '| Verify (memory) | ' + tvm + ' | ' + pvm + ' | - |',
+              '| Repair (time) | ${{ steps.benchmark.outputs.turbo_repair_time }}s | ${{ steps.benchmark.outputs.par2rs_repair_time }}s | ${{ steps.benchmark.outputs.repair_speedup }}x |',
+              '| Repair (memory) | ' + trm + ' | ' + prm + ' | - |',
+              '',
+              'MD5: `${{ steps.benchmark.outputs.original_md5 }}` (verified)'
+            ];
             github.rest.issues.createComment({
               issue_number: context.issue.number,
               owner: context.repo.owner,
               repo: context.repo.repo,
-              body: comment
+              body: lines.join('\n')
             });
 
       - name: Upload benchmark results
