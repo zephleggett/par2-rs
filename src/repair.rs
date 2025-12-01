@@ -42,6 +42,9 @@ use std::cell::RefCell;
 
 use std::cell::UnsafeCell;
 
+/// Type alias for chunk write operations: (block_idx, chunk_offset, data)
+type ChunkWrites = Vec<(usize, u64, Vec<u8>)>;
+
 #[cfg(not(unix))]
 thread_local! {
     static FILE_HANDLE_CACHE: RefCell<HashMap<PathBuf, File>> = RefCell::new(HashMap::new());
@@ -558,11 +561,11 @@ pub fn repair_files_parallel(
         let batch_len = batch_end - batch_start;
 
         // Pre-allocate result storage for this batch only (bounded memory)
-        let results: Vec<UnsafeCell<Option<Result<Vec<(usize, u64, Vec<u8>)>>>>> =
+        let results: Vec<UnsafeCell<Option<Result<ChunkWrites>>>> =
             (0..batch_len).map(|_| UnsafeCell::new(None)).collect();
 
         // SAFETY: Each thread writes to disjoint indices within this batch
-        struct ResultsWrapper<'a>(&'a [UnsafeCell<Option<Result<Vec<(usize, u64, Vec<u8>)>>>>]);
+        struct ResultsWrapper<'a>(&'a [UnsafeCell<Option<Result<ChunkWrites>>>]);
         unsafe impl<'a> Sync for ResultsWrapper<'a> {}
         let results_wrapper = ResultsWrapper(&results);
 
@@ -620,8 +623,8 @@ pub fn repair_files_parallel(
         }); // Sync point per mega-batch (only ~10 total)
 
         // Write results from this batch immediately (enables I/O pipelining)
-        for local_idx in 0..batch_len {
-            let chunk_result = unsafe { (*results[local_idx].get()).take() }.ok_or_else(|| {
+        for (local_idx, result_cell) in results.iter().enumerate() {
+            let chunk_result = unsafe { (*result_cell.get()).take() }.ok_or_else(|| {
                 Par2Error::RepairFailed(format!(
                     "Chunk {} was not processed",
                     batch_start + local_idx
