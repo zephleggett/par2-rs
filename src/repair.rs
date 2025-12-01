@@ -292,18 +292,19 @@ pub fn repair_files_parallel(
     let est_mb_per_chunk = (blocks_loaded_per_chunk * chunk_size) / (1024 * 1024);
 
     // Adaptive parallelism based on system resources
-    // Reduced multipliers to avoid over-subscription on CI/container environments
+    // With accurate core detection from available_parallelism(), we can use
+    // aggressive multipliers without over-subscribing
     let default_multiplier = if good_indices.len() < 100 {
-        // Sparse case: moderate parallelism
-        (num_cpus * 2).clamp(4, 16)
+        // Sparse case: can use more parallelism
+        (num_cpus * 2).clamp(8, 20)
     } else {
-        // Dense case: conservative multipliers for better scheduling
+        // Dense case: aggressive for maximum speed
         if num_cpus >= 8 {
-            4 // High-core systems: moderate
+            10 // High-core systems: very aggressive
         } else if num_cpus >= 4 {
-            3 // Mid-range: conservative
+            6 // Mid-range: aggressive
         } else {
-            2 // Low-core systems: minimal
+            4 // Low-core systems: still aggressive since cores are accurate
         }
     };
 
