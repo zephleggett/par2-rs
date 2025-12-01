@@ -42,9 +42,71 @@ use std::cell::RefCell;
 
 use std::cell::UnsafeCell;
 
+use std::sync::Once;
+
+static RAYON_INIT: Once = Once::new();
+
+/// Initialize rayon thread pool with container-aware CPU count
+fn init_rayon_pool() {
+    RAYON_INIT.call_once(|| {
+        let cpus = get_effective_cpus_internal();
+        if let Err(e) = rayon::ThreadPoolBuilder::new()
+            .num_threads(cpus)
+            .build_global()
+        {
+            // Pool already initialized, that's fine
+            tracing::debug!("Rayon pool already initialized: {}", e);
+        } else {
+            tracing::debug!(cpus, "Initialized rayon thread pool");
+        }
+    });
+}
+
 /// Get effective CPU count, accounting for container limits (cgroups)
 /// This is important for CI runners where available_parallelism() returns host CPUs
 fn get_effective_cpus() -> usize {
+    init_rayon_pool();
+    get_effective_cpus_internal()
+}
+
+/// Get ideal chunk size based on SIMD capability
+/// Values match par2cmdline-turbo's idealChunkSize settings
+fn get_ideal_chunk_size() -> usize {
+    #[cfg(target_arch = "aarch64")]
+    {
+        // NEON: 8KB matches par2cmdline-turbo's idealChunkSize for ARM
+        8 * 1024
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        // Detect x86 SIMD level at runtime
+        if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("gfni") {
+            // AVX512 + GFNI: 128KB (par2cmdline-turbo peak)
+            128 * 1024
+        } else if is_x86_feature_detected!("avx512f") {
+            // AVX512: 64KB
+            64 * 1024
+        } else if is_x86_feature_detected!("avx2") {
+            // AVX2: 48KB (Skylake-X optimized in turbo)
+            48 * 1024
+        } else if is_x86_feature_detected!("ssse3") {
+            // SSSE3: 32KB
+            32 * 1024
+        } else {
+            // SSE2 fallback: 16KB
+            16 * 1024
+        }
+    }
+
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        // Generic fallback: 32KB
+        32 * 1024
+    }
+}
+
+fn get_effective_cpus_internal() -> usize {
     // First try cgroups v2 (modern containers)
     #[cfg(target_os = "linux")]
     {
@@ -427,32 +489,53 @@ pub fn repair_files_parallel(
     let total_recovery_count = par2_data.recovery_blocks.len();
     let rs = Arc::new(Par2ReedSolomon::new(total_blocks, total_recovery_count));
 
-    // Chunk size for optimal balance between syscalls and parallelism
-    // Use container-aware CPU detection (cgroups on Linux, available_parallelism elsewhere)
+    // Chunk size calculation inspired by par2cmdline-turbo
+    // Their approach: idealChunkSize varies by SIMD level, then adapt based on slice size
+    // Key insight: with single sync point, we can use larger chunks (less overhead)
     let num_cpus = get_effective_cpus();
 
-    // Target chunk size to ensure good parallelism
-    // Smaller chunks = more parallelism, but more overhead
-    // Target ~4x CPU cores worth of chunks minimum for good load balancing
-    let target_chunks = (num_cpus * 4).max(16);
+    // Ideal chunk size varies by SIMD capability (matches par2cmdline-turbo's values)
+    let ideal_chunk_size = get_ideal_chunk_size();
 
-    // Allow override via env, otherwise use adaptive minimum based on block size
-    // Benchmarking shows smaller chunks (more parallelism) is better even for large blocks
-    // Target: at least num_cpus * 4 chunks for good load balancing
-    let min_chunk_default = (block_size / (num_cpus * 4)).max(4096).min(32 * 1024);
-    let min_chunk_env = std::env::var("PAR2_MIN_CHUNK")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(min_chunk_default);
-    let mut chunk_size = (block_size / target_chunks).max(min_chunk_env);
-    if chunk_size > block_size {
-        chunk_size = block_size; // never exceed block size
+    // Calculate chunk size similar to turbo's calcChunkSize()
+    // Target: split work evenly across threads with ~4 chunks per thread for load balancing
+    let target_chunks_per_thread = 4;
+    let target_chunks = num_cpus * target_chunks_per_thread;
+
+    // Start with block_size / target_chunks, but respect ideal_chunk_size
+    let mut chunk_size = if block_size <= ideal_chunk_size * num_cpus {
+        // Small blocks: just divide evenly by thread count
+        (block_size / num_cpus).max(4096)
+    } else {
+        // Large blocks: use ideal chunk size, adjusted for thread count
+        let per_thread_chunk = block_size / num_cpus;
+        if per_thread_chunk <= ideal_chunk_size / 2 {
+            // Per-thread work is small, use simple division
+            (block_size / target_chunks).max(4096)
+        } else {
+            // Per-thread work is large enough, use ideal-based sizing
+            let chunks_per_thread = (per_thread_chunk / ideal_chunk_size).max(1);
+            block_size / (num_cpus * chunks_per_thread)
+        }
+    };
+
+    // Allow environment override
+    if let Ok(min_chunk_str) = std::env::var("PAR2_MIN_CHUNK") {
+        if let Ok(min_chunk) = min_chunk_str.parse::<usize>() {
+            chunk_size = chunk_size.max(min_chunk);
+        }
     }
+
+    // Clamp to valid range (handle small block sizes where block_size < 4096)
+    let min_chunk = 4096.min(block_size);
+    chunk_size = chunk_size.clamp(min_chunk, block_size);
     let chunk_size = (chunk_size / 2) * 2; // Ensure even for u16 alignment
+    let chunk_size = chunk_size.max(2); // Ensure at least 2 bytes for u16 alignment
     let num_chunks = block_size.div_ceil(chunk_size);
 
     let num_damaged = damaged_block_indices.len();
     tracing::info!(
+        ideal_chunk_kb = ideal_chunk_size / 1024,
         chunk_size,
         chunk_size_kb = chunk_size / 1000,
         num_chunks,
@@ -586,133 +669,114 @@ pub fn repair_files_parallel(
         num_chunks
     );
 
-    // Hybrid approach: mega-batches with rayon::scope inside each
-    // This enables I/O pipelining (write batch N while computing batch N+1)
-    // while keeping synchronization overhead low (~10 sync points vs hundreds)
-    // Use container-aware CPU count for thread distribution
+    // Single parallel phase: process ALL chunks in one rayon::scope
+    // This matches par2cmdline-turbo's approach: static work distribution, single sync point
+    // Benefits:
+    // - Only 1 sync point instead of 10-20 (mega-batches)
+    // - No work-stealing overhead - each thread processes contiguous chunks
+    // - Better cache locality within each thread's work range
     let num_threads = get_effective_cpus();
-
-    // Mega-batch size: large enough to amortize sync overhead, small enough for I/O pipelining
-    // Target: ~10-20 batches total for good pipelining without excessive sync
-    let mega_batch_size = (num_chunks / 10).max(num_threads * 4).min(num_chunks);
 
     tracing::debug!(
         num_chunks,
         num_threads,
-        mega_batch_size,
-        num_batches = num_chunks.div_ceil(mega_batch_size),
-        "Mega-batch configuration for parallel repair"
+        chunks_per_thread = num_chunks.div_ceil(num_threads),
+        "Single-phase parallel repair (1 sync point)"
     );
 
-    let mut total_writes = 0;
+    // Pre-allocate result storage for ALL chunks
+    // With 100KB chunks on a 1GB file = ~10K chunks, each result is small (just write coords)
+    let results: Vec<UnsafeCell<Option<Result<ChunkWrites>>>> =
+        (0..num_chunks).map(|_| UnsafeCell::new(None)).collect();
 
-    for batch_start in (0..num_chunks).step_by(mega_batch_size) {
-        let batch_end = (batch_start + mega_batch_size).min(num_chunks);
-        let batch_len = batch_end - batch_start;
+    // SAFETY: Each thread writes to disjoint indices
+    struct ResultsWrapper<'a>(&'a [UnsafeCell<Option<Result<ChunkWrites>>>]);
+    unsafe impl<'a> Sync for ResultsWrapper<'a> {}
+    let results_wrapper = ResultsWrapper(&results);
 
-        // Pre-allocate result storage for this batch only (bounded memory)
-        let results: Vec<UnsafeCell<Option<Result<ChunkWrites>>>> =
-            (0..batch_len).map(|_| UnsafeCell::new(None)).collect();
+    // Static distribution: divide chunks evenly across threads
+    let chunks_per_thread = num_chunks.div_ceil(num_threads);
 
-        // SAFETY: Each thread writes to disjoint indices within this batch
-        struct ResultsWrapper<'a>(&'a [UnsafeCell<Option<Result<ChunkWrites>>>]);
-        unsafe impl<'a> Sync for ResultsWrapper<'a> {}
-        let results_wrapper = ResultsWrapper(&results);
+    rayon::scope(|s| {
+        for thread_id in 0..num_threads {
+            let start = thread_id * chunks_per_thread;
+            let end = (start + chunks_per_thread).min(num_chunks);
 
-        // Static distribution within mega-batch
-        let chunks_per_thread = batch_len.div_ceil(num_threads);
-
-        rayon::scope(|s| {
-            for thread_id in 0..num_threads {
-                let start = thread_id * chunks_per_thread;
-                let end = (start + chunks_per_thread).min(batch_len);
-
-                if start >= batch_len {
-                    break;
-                }
-
-                // Borrow all the data we need (rayon::scope allows this)
-                let block_to_file = &block_to_file;
-                let file_paths = &file_paths;
-                let input_files = &input_files;
-                let recovery_blocks = &recovery_blocks;
-                let recovery_file_handles = &recovery_file_handles;
-                let rs = &rs;
-                let damaged_block_indices = &damaged_block_indices;
-                let good_indices = &good_indices;
-                let present_recovery_indices = &present_recovery_indices;
-                let transform = &transform;
-                let results_wrapper = &results_wrapper;
-
-                s.spawn(move |_| {
-                    for local_idx in start..end {
-                        let chunk_idx = batch_start + local_idx;
-                        let result = process_chunk(
-                            chunk_idx,
-                            chunk_size,
-                            block_size,
-                            total_blocks,
-                            block_to_file,
-                            file_paths,
-                            input_files,
-                            recovery_blocks,
-                            recovery_file_handles,
-                            rs,
-                            damaged_block_indices,
-                            good_indices,
-                            present_recovery_indices,
-                            transform,
-                        );
-                        // SAFETY: Each thread writes to disjoint indices
-                        unsafe {
-                            *results_wrapper.0[local_idx].get() = Some(result);
-                        }
-                    }
-                });
+            if start >= num_chunks {
+                break;
             }
-        }); // Sync point per mega-batch (only ~10 total)
 
-        // Write results from this batch immediately (enables I/O pipelining)
-        for (local_idx, result_cell) in results.iter().enumerate() {
-            let chunk_result = unsafe { (*result_cell.get()).take() }.ok_or_else(|| {
-                Par2Error::RepairFailed(format!(
-                    "Chunk {} was not processed",
-                    batch_start + local_idx
-                ))
-            })?;
+            // Borrow all the data we need (rayon::scope allows this)
+            let block_to_file = &block_to_file;
+            let file_paths = &file_paths;
+            let input_files = &input_files;
+            let recovery_blocks = &recovery_blocks;
+            let recovery_file_handles = &recovery_file_handles;
+            let rs = &rs;
+            let damaged_block_indices = &damaged_block_indices;
+            let good_indices = &good_indices;
+            let present_recovery_indices = &present_recovery_indices;
+            let transform = &transform;
+            let results_wrapper = &results_wrapper;
 
-            for (block_idx, chunk_offset, data) in chunk_result? {
-                if let Some(&(file_id, block_in_file)) = block_to_file.get(&block_idx) {
-                    if let Some(file) = output_files.get_mut(&file_id) {
-                        if let Some(file_info) = file_map.get(&file_id) {
-                            let block_byte_offset = (block_in_file * block_size) as u64;
-                            let write_offset = block_byte_offset + chunk_offset;
+            // Each thread gets exactly one task - processes contiguous range of chunks
+            s.spawn(move |_| {
+                for chunk_idx in start..end {
+                    let result = process_chunk(
+                        chunk_idx,
+                        chunk_size,
+                        block_size,
+                        total_blocks,
+                        block_to_file,
+                        file_paths,
+                        input_files,
+                        recovery_blocks,
+                        recovery_file_handles,
+                        rs,
+                        damaged_block_indices,
+                        good_indices,
+                        present_recovery_indices,
+                        transform,
+                    );
+                    // SAFETY: Each thread writes to disjoint indices
+                    unsafe {
+                        *results_wrapper.0[chunk_idx].get() = Some(result);
+                    }
+                }
+            });
+        }
+    }); // Single sync point here - all processing complete
 
-                            file.seek(SeekFrom::Start(write_offset))?;
+    // Write all results sequentially (I/O is not the bottleneck)
+    let mut total_writes = 0;
+    for (chunk_idx, result_cell) in results.iter().enumerate() {
+        let chunk_result = unsafe { (*result_cell.get()).take() }.ok_or_else(|| {
+            Par2Error::RepairFailed(format!("Chunk {} was not processed", chunk_idx))
+        })?;
 
-                            let file_remaining = file_info.length.saturating_sub(write_offset);
-                            let bytes_to_write = (data.len() as u64).min(file_remaining) as usize;
+        for (block_idx, chunk_offset, data) in chunk_result? {
+            if let Some(&(file_id, block_in_file)) = block_to_file.get(&block_idx) {
+                if let Some(file) = output_files.get_mut(&file_id) {
+                    if let Some(file_info) = file_map.get(&file_id) {
+                        let block_byte_offset = (block_in_file * block_size) as u64;
+                        let write_offset = block_byte_offset + chunk_offset;
 
-                            if bytes_to_write > 0 {
-                                file.write_all(&data[..bytes_to_write])?;
-                                total_writes += 1;
-                            }
+                        file.seek(SeekFrom::Start(write_offset))?;
+
+                        let file_remaining = file_info.length.saturating_sub(write_offset);
+                        let bytes_to_write = (data.len() as u64).min(file_remaining) as usize;
+
+                        if bytes_to_write > 0 {
+                            file.write_all(&data[..bytes_to_write])?;
+                            total_writes += 1;
                         }
                     }
                 }
             }
         }
-
-        // Progress tracking per mega-batch
-        tracing::debug!(
-            batch_start,
-            batch_end,
-            total = num_chunks,
-            progress_pct = (batch_end * 100) / num_chunks,
-            total_writes,
-            "Completed mega-batch"
-        );
     }
+
+    tracing::debug!(total_writes, num_chunks, "All chunks written");
 
     // Verify chunks were written (note: total_writes may be less than theoretical max due to partial last blocks)
     let theoretical_max_writes = num_chunks * damaged_block_indices.len();
