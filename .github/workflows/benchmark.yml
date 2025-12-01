@@ -1,0 +1,120 @@
+name: Performance Benchmark
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:  # Allow manual trigger
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  benchmark:
+    name: Benchmark (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ${{ matrix.os }}-benchmark
+
+      - name: Report CPU features
+        run: |
+          echo "=== CPU Features ==="
+          if [ "$(uname -s)" = "Linux" ]; then
+            echo "CPU: $(grep 'model name' /proc/cpuinfo | head -1 | cut -d: -f2 | xargs)"
+            echo ""
+            echo "SIMD features:"
+            grep -o '\(avx512[^ ]*\|avx2\|avx\|pclmulqdq\|ssse3\|sse4_1\|gfni\)' /proc/cpuinfo | sort -u || echo "  (basic x86-64)"
+          else
+            echo "CPU: $(sysctl -n machdep.cpu.brand_string)"
+            echo ""
+            echo "ARM features: NEON (always available on ARM64)"
+          fi
+          echo ""
+
+      - name: Build release binaries
+        run: cargo build --release --bins
+        env:
+          RUSTFLAGS: "-C target-cpu=native"
+
+      - name: Run benchmark
+        id: benchmark
+        run: |
+          chmod +x scripts/benchmark.sh
+          scripts/benchmark.sh
+
+      - name: Display results as step summary
+        if: always()
+        run: |
+          echo "## Benchmark (${{ steps.benchmark.outputs.platform }})" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Operation | par2cmdline-turbo | par2-rs | Speedup |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----------|-------------------|---------|---------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Create (1GB, 10% red) | ${{ steps.benchmark.outputs.turbo_create_time }}s | ${{ steps.benchmark.outputs.par2rs_create_time }}s | .${{ steps.benchmark.outputs.create_speedup }}x |" >> $GITHUB_STEP_SUMMARY
+          echo "| Verify (1GB) | ${{ steps.benchmark.outputs.turbo_verify_time }}s | ${{ steps.benchmark.outputs.par2rs_verify_time }}s | ${{ steps.benchmark.outputs.verify_speedup }}x |" >> $GITHUB_STEP_SUMMARY
+          echo "| Repair (100MB corrupt) | ${{ steps.benchmark.outputs.turbo_repair_time }}s | ${{ steps.benchmark.outputs.par2rs_repair_time }}s | .${{ steps.benchmark.outputs.repair_speedup }}x |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "MD5: \`${{ steps.benchmark.outputs.original_md5 }}\` (verified)" >> $GITHUB_STEP_SUMMARY
+
+      - name: Add performance annotations
+        if: always()
+        run: |
+          VERIFY_SPEEDUP=${{ steps.benchmark.outputs.verify_speedup }}
+          REPAIR_SPEEDUP=${{ steps.benchmark.outputs.repair_speedup }}
+
+          if (( $(echo "$VERIFY_SPEEDUP > 1" | bc -l) )); then
+            echo "::notice title=Verify::${VERIFY_SPEEDUP}x faster"
+          fi
+
+          if (( $(echo "$REPAIR_SPEEDUP > 1" | bc -l) )); then
+            echo "::notice title=Repair::${REPAIR_SPEEDUP}x faster"
+          fi
+
+          echo "::notice title=MD5::${{ steps.benchmark.outputs.original_md5 }} verified"
+
+      - name: Post results as comment (PR only)
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const platform = '${{ steps.benchmark.outputs.platform }}';
+
+            const comment = `## Benchmark (${platform})
+
+            | Operation | par2cmdline-turbo | par2-rs | Speedup |
+            |-----------|-------------------|---------|---------|
+            | Create (1GB, 10% red) | ${{ steps.benchmark.outputs.turbo_create_time }}s | ${{ steps.benchmark.outputs.par2rs_create_time }}s | .${{ steps.benchmark.outputs.create_speedup }}x |
+            | Verify (1GB) | ${{ steps.benchmark.outputs.turbo_verify_time }}s | ${{ steps.benchmark.outputs.par2rs_verify_time }}s | ${{ steps.benchmark.outputs.verify_speedup }}x |
+            | Repair (100MB corrupt) | ${{ steps.benchmark.outputs.turbo_repair_time }}s | ${{ steps.benchmark.outputs.par2rs_repair_time }}s | .${{ steps.benchmark.outputs.repair_speedup }}x |
+
+            MD5: \`${{ steps.benchmark.outputs.original_md5 }}\` (verified)`;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });
+
+      - name: Upload benchmark results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results-${{ steps.benchmark.outputs.platform }}
+          path: benchmark-results-*.txt
+          retention-days: 30
+          if-no-files-found: warn

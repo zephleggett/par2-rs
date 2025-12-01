@@ -1,0 +1,33 @@
+# Build artifacts
+/target
+*.rlib
+*.so
+*.dylib
+*.dll
+
+# IDE and editor files
+.claude/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+CLAUDE.md
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary and test files
+tmp/
+*.tmp
+*.bak
+
+# PAR2 test files
+*.par2
+*.PAR2
+tests/fixtures/*.par2
+tests/fixtures/*.PAR2
+
+# Logs
+*.log
