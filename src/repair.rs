@@ -390,11 +390,15 @@ pub fn repair_files_parallel(
     // Smaller chunks = more parallelism, but more overhead
     // Target ~4x CPU cores worth of chunks minimum for good load balancing
     let target_chunks = (num_cpus * 4).max(16);
-    // Allow override via env, default to 64KB minimum to reduce syscall overhead
+
+    // Allow override via env, otherwise use adaptive minimum based on block size
+    // Benchmarking shows smaller chunks (more parallelism) is better even for large blocks
+    // Target: at least num_cpus * 4 chunks for good load balancing
+    let min_chunk_default = (block_size / (num_cpus * 4)).max(4096).min(32 * 1024);
     let min_chunk_env = std::env::var("PAR2_MIN_CHUNK")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(64 * 1024);
+        .unwrap_or(min_chunk_default);
     let mut chunk_size = (block_size / target_chunks).max(min_chunk_env);
     if chunk_size > block_size {
         chunk_size = block_size; // never exceed block size

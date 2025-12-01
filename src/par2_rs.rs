@@ -13,6 +13,43 @@ use crate::galois::{
     self, gf_mul, gf_muladd, gf_muladd_column, gf_muladd_column_shuffle2x, gf_pow,
 };
 use rayon::prelude::*;
+use std::cell::UnsafeCell;
+
+// Thread-local buffer pool for u16 vectors to avoid allocations in hot paths
+thread_local! {
+    static U16_BUFFER_POOL: UnsafeCell<Vec<Vec<u16>>> = const { UnsafeCell::new(Vec::new()) };
+}
+
+/// Get a u16 buffer from the thread-local pool, or allocate a new one
+#[inline]
+fn get_pooled_u16_buffer(size: usize) -> Vec<u16> {
+    U16_BUFFER_POOL.with(|pool| {
+        // SAFETY: We're the only thread accessing this pool
+        let pool = unsafe { &mut *pool.get() };
+        if let Some(mut buf) = pool.pop() {
+            if buf.capacity() >= size {
+                buf.clear();
+                buf.resize(size, 0);
+                return buf;
+            }
+            // Buffer too small, drop it and allocate new
+        }
+        vec![0u16; size]
+    })
+}
+
+/// Return a u16 buffer to the thread-local pool for reuse
+#[inline]
+fn return_pooled_u16_buffer(buf: Vec<u16>) {
+    U16_BUFFER_POOL.with(|pool| {
+        // SAFETY: We're the only thread accessing this pool
+        let pool = unsafe { &mut *pool.get() };
+        // Keep pool size bounded
+        if pool.len() < 32 {
+            pool.push(buf);
+        }
+    })
+}
 
 /// SAFETY: Caller must ensure the returned slice does not alias with any
 /// other mutable reference and that `len` does not exceed the capacity of `vec`.
@@ -495,15 +532,17 @@ impl Par2ReedSolomon {
             let batch_end_col = (batch_start_col + SRC_BATCH).min(used_data_cols.len());
             let batch_len = batch_end_col - batch_start_col;
 
-            // Read batch of sources; do not perform zero-detection (include all)
-            data_chunks_u16.clear();
+            // Return previous batch buffers to pool before clearing
+            for buf in data_chunks_u16.drain(..) {
+                return_pooled_u16_buffer(buf);
+            }
             // Store col_pos for each item in this batch (avoids HashMap lookup)
             let mut batch_col_positions: Vec<usize> = Vec::with_capacity(batch_len);
             for &(data_idx, col_pos) in &used_data_cols[batch_start_col..batch_end_col] {
                 let data_chunk_bytes = read_block(data_idx, chunk_offset, chunk_size)?;
 
-                // Convert to u16 using SIMD and keep
-                let mut buf = vec![0u16; chunk_symbols];
+                // Convert to u16 using pooled buffer to avoid allocation
+                let mut buf = get_pooled_u16_buffer(chunk_symbols);
                 galois::bytes_to_u16_simd(&data_chunk_bytes, &mut buf);
 
                 // Convert to shuffle2x format if supported
@@ -563,6 +602,11 @@ impl Par2ReedSolomon {
             batch_start_col = batch_end_col;
         }
 
+        // Return final batch of buffers to pool
+        for buf in data_chunks_u16.drain(..) {
+            return_pooled_u16_buffer(buf);
+        }
+
         // Convert accumulators back from shuffle2x to interleaved format before Gaussian elimination
         if use_shuffle2x {
             for acc in accumulators.iter_mut() {
@@ -610,11 +654,19 @@ impl Par2ReedSolomon {
             }
         }
 
-        // PHASE 5: Write results via callback
+        // PHASE 5: Write results via callback (optimized direct byte conversion)
         for (row, &miss_idx) in missing_indices.iter().enumerate() {
-            let mut output = Vec::with_capacity(chunk_size);
-            for &val in &accumulators[row] {
-                output.extend_from_slice(&val.to_le_bytes());
+            // Direct byte conversion without per-element extend_from_slice
+            let acc = &accumulators[row];
+            let mut output = vec![0u8; chunk_size];
+            // SAFETY: output has exact capacity for acc.len() * 2 bytes, and u16 is 2 bytes
+            let out_ptr = output.as_mut_ptr();
+            for (i, &val) in acc.iter().enumerate() {
+                let bytes = val.to_le_bytes();
+                unsafe {
+                    *out_ptr.add(i * 2) = bytes[0];
+                    *out_ptr.add(i * 2 + 1) = bytes[1];
+                }
             }
             write_result(miss_idx, output)?;
         }
