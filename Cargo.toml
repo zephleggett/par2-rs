@@ -19,12 +19,17 @@ exclude = [
 ]
 
 [dependencies]
-md-5 = { version = "0.10", features = ["asm"] }
+# Use asm feature only on Unix (Linux/macOS) - not supported on Windows
+md-5 = "0.10"
 crc32fast = "1.4"
 rayon = "1.10"
 thiserror = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Enable asm feature on non-Windows platforms
+[target.'cfg(not(windows))'.dependencies]
+md-5 = { version = "0.10", features = ["asm"] }
 
 [dev-dependencies]
 tempfile = "3.23"
