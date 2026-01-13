@@ -192,7 +192,7 @@ fn process_chunk(
     block_size: usize,
     total_blocks: usize,
     block_to_file: &HashMap<usize, (FileHash, usize)>,
-    #[cfg_attr(unix, allow(unused))] file_paths: &HashMap<FileHash, PathBuf>,
+    #[allow(unused)] file_paths: &HashMap<FileHash, PathBuf>,
     input_files: &HashMap<FileHash, File>,
     recovery_blocks: &[crate::parser::RecoveryBlock],
     recovery_file_handles: &HashMap<PathBuf, File>,
