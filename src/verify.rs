@@ -25,7 +25,7 @@
 //! - [`crate::parser`]: Provides IFSC checksum data
 
 use super::parser::{FileHash, FileInfo, Par2File};
-use super::{Par2Operation, ProgressCallback};
+use super::{MessageCallback, MessageLevel, Par2Operation, ProgressCallback};
 use crate::error::{Par2Error, Result};
 use rayon::prelude::*;
 use std::collections::HashMap;
@@ -55,15 +55,31 @@ pub struct VerificationResult {
 }
 
 /// Verify files against PAR2 data
+#[allow(dead_code)]
 pub fn verify_files(
     par2_data: &Par2File,
     extra_files: &[PathBuf],
     base_path: &Path,
     progress_callback: Option<ProgressCallback>,
 ) -> Result<VerificationResult> {
-    let total_files = par2_data.files.len() as u64;
+    verify_files_with_messages(par2_data, extra_files, base_path, progress_callback, None)
+}
+
+/// Verify files against PAR2 data with message callback
+pub fn verify_files_with_messages(
+    par2_data: &Par2File,
+    extra_files: &[PathBuf],
+    base_path: &Path,
+    progress_callback: Option<ProgressCallback>,
+    message_callback: Option<MessageCallback>,
+) -> Result<VerificationResult> {
+    // Calculate total bytes for byte-level progress
+    let total_bytes: u64 = par2_data.files.values().map(|f| f.length).sum();
+    let bytes_verified = Arc::new(AtomicU64::new(0));
+
     tracing::info!(
-        files = total_files,
+        files = par2_data.files.len(),
+        total_bytes = total_bytes,
         block_size = par2_data.block_size,
         "Starting verification"
     );
@@ -71,7 +87,6 @@ pub fn verify_files(
     // Use Arc<Mutex> for thread-safe collections
     let verified_files = Arc::new(Mutex::new(HashMap::new()));
     let damaged_files = Arc::new(Mutex::new(Vec::new()));
-    let verified_count = Arc::new(AtomicU64::new(0));
 
     let mut renamed_files = Vec::new();
 
@@ -89,11 +104,22 @@ pub fn verify_files(
                 .get(*file_id)
                 .map(|v| v.as_slice());
 
+            // Create intra-file progress callback that updates as bytes are read
+            let bytes_verified_ref = &bytes_verified;
+            let progress_callback_ref = &progress_callback;
+            let intra_progress = |bytes: u64| {
+                let done = bytes_verified_ref.fetch_add(bytes, Ordering::Relaxed) + bytes;
+                if let Some(ref cb) = progress_callback_ref {
+                    cb(Par2Operation::Verifying, done, total_bytes);
+                }
+            };
+
             match verify_file_smart(
                 &expected_path,
                 file_info,
                 slice_checksums,
                 par2_data.block_size,
+                Some(&intra_progress),
             ) {
                 Ok(true) => {
                     tracing::debug!(
@@ -105,22 +131,21 @@ pub fn verify_files(
                     if let Ok(mut files) = verified_files.lock() {
                         files.insert(**file_id, expected_path);
                     }
-                    let count = verified_count.fetch_add(1, Ordering::Relaxed) + 1;
-                    if let Some(ref cb) = progress_callback {
-                        cb(Par2Operation::Verifying, count, total_files);
-                    }
                 }
                 Ok(false) => {
-                    tracing::warn!(
-                        path = %expected_path.display(),
-                        "File damaged by name"
-                    );
+                    tracing::warn!(path = %expected_path.display(), "File damaged");
+                    if let Some(ref msg_cb) = message_callback {
+                        msg_cb(
+                            MessageLevel::Warning,
+                            &format!("File damaged: {}", expected_path.display()),
+                        );
+                    }
+                    // Store path so repair can find it
+                    if let Ok(mut files) = verified_files.lock() {
+                        files.insert(**file_id, expected_path);
+                    }
                     if let Ok(mut files) = damaged_files.lock() {
                         files.push(**file_id);
-                    }
-                    let count = verified_count.fetch_add(1, Ordering::Relaxed) + 1;
-                    if let Some(ref cb) = progress_callback {
-                        cb(Par2Operation::Verifying, count, total_files);
                     }
                 }
                 Err(_) => {
@@ -138,13 +163,14 @@ pub fn verify_files(
         .map_err(|_| Par2Error::RepairFailed("Failed to unwrap verified_files Arc".to_string()))?
         .into_inner()
         .map_err(|_| Par2Error::RepairFailed("Mutex poisoned: verified_files".to_string()))?;
-    let mut damaged_files = Arc::try_unwrap(damaged_files)
+    let damaged_files = Arc::try_unwrap(damaged_files)
         .map_err(|_| Par2Error::RepairFailed("Failed to unwrap damaged_files Arc".to_string()))?
         .into_inner()
         .map_err(|_| Par2Error::RepairFailed("Mutex poisoned: damaged_files".to_string()))?;
     let mut missing_files = Vec::new();
 
     // Second pass: Try to match remaining files by hash (for obfuscated names)
+    // OPTIMIZATION: Build a size-based index for fast filtering (most files have unique sizes)
     let unmatched_file_ids: Vec<_> = par2_data
         .files
         .keys()
@@ -153,49 +179,83 @@ pub fn verify_files(
         .collect();
 
     if !unmatched_file_ids.is_empty() {
-        for extra_path in extra_files {
-            // Skip files we already matched
-            if verified_files.values().any(|p| p == extra_path) {
-                continue;
+        // Build size -> file_ids map for O(1) size filtering
+        let mut size_to_file_ids: HashMap<u64, Vec<FileHash>> = HashMap::new();
+        for file_id in &unmatched_file_ids {
+            if let Some(file_info) = par2_data.files.get(file_id) {
+                size_to_file_ids
+                    .entry(file_info.length)
+                    .or_default()
+                    .push(*file_id);
             }
+        }
 
-            // Try to match this file against unmatched file_ids by hash
-            for file_id in &unmatched_file_ids {
-                if let Some(file_info) = par2_data.files.get(file_id) {
-                    let slice_checksums =
-                        par2_data.slice_checksums.get(file_id).map(|v| v.as_slice());
-                    match verify_file_smart(
-                        extra_path,
-                        file_info,
-                        slice_checksums,
-                        par2_data.block_size,
-                    ) {
-                        Ok(true) => {
-                            // Found a match! This file should be renamed
-                            verified_files.insert(*file_id, extra_path.clone());
-                            renamed_files.push((extra_path.clone(), file_info.name.clone()));
-                            tracing::info!(
-                                current_path = %extra_path.display(),
-                                correct_name = %file_info.name,
-                                "File OK by hash (obfuscated filename)"
-                            );
-                            break;
-                        }
-                        Ok(false) => {
-                            // Hash matches but file is damaged
-                            damaged_files.push(*file_id);
-                            tracing::warn!(
-                                path = %extra_path.display(),
-                                expected_name = %file_info.name,
-                                "File damaged by hash"
-                            );
-                            break;
-                        }
-                        Err(_) => {
-                            // Doesn't match this file_info, try next
-                            continue;
+        // Filter extra_files to only those not already matched and get their sizes
+        let extra_files_filtered: Vec<_> = extra_files
+            .iter()
+            .filter(|p| !verified_files.values().any(|v| v == *p))
+            .filter_map(|p| std::fs::metadata(p).ok().map(|m| (p.clone(), m.len())))
+            .collect();
+
+        // Process extra files in parallel for faster obfuscated file detection
+        // Note: We pass None for progress here since we're just matching, not doing final verification
+        // Progress will be updated after a match is found
+        let matches: Vec<_> = extra_files_filtered
+            .par_iter()
+            .filter_map(|(extra_path, extra_size)| {
+                // Quick filter: only check file_ids with matching size
+                let candidate_ids = size_to_file_ids.get(extra_size)?;
+
+                // Create intra-file progress callback
+                let bytes_verified_ref = &bytes_verified;
+                let progress_callback_ref = &progress_callback;
+                let intra_progress = |bytes: u64| {
+                    let done = bytes_verified_ref.fetch_add(bytes, Ordering::Relaxed) + bytes;
+                    if let Some(ref cb) = progress_callback_ref {
+                        cb(Par2Operation::Verifying, done, total_bytes);
+                    }
+                };
+
+                for file_id in candidate_ids {
+                    if let Some(file_info) = par2_data.files.get(file_id) {
+                        let slice_checksums =
+                            par2_data.slice_checksums.get(file_id).map(|v| v.as_slice());
+                        if let Ok(true) = verify_file_smart(
+                            extra_path,
+                            file_info,
+                            slice_checksums,
+                            par2_data.block_size,
+                            Some(&intra_progress),
+                        ) {
+                            return Some((*file_id, extra_path.clone(), file_info.name.clone()));
                         }
                     }
+                }
+                None
+            })
+            .collect();
+
+        // Apply matches (need to dedupe in case multiple files matched same file_id)
+        let mut matched_file_ids: std::collections::HashSet<FileHash> =
+            std::collections::HashSet::new();
+        for (file_id, extra_path, correct_name) in matches {
+            if matched_file_ids.insert(file_id) {
+                verified_files.insert(file_id, extra_path.clone());
+                renamed_files.push((extra_path.clone(), correct_name.clone()));
+                tracing::info!(
+                    current = %extra_path.display(),
+                    correct = %correct_name,
+                    "Found obfuscated file"
+                );
+                if let Some(ref msg_cb) = message_callback {
+                    msg_cb(
+                        MessageLevel::Info,
+                        &format!(
+                            "Found obfuscated file: {} -> {}",
+                            extra_path.file_name().unwrap_or_default().to_string_lossy(),
+                            correct_name
+                        ),
+                    );
                 }
             }
         }
@@ -214,6 +274,17 @@ pub fn verify_files(
                     correct_name,
                     e
                 );
+                if let Some(ref msg_cb) = message_callback {
+                    msg_cb(
+                        MessageLevel::Warning,
+                        &format!(
+                            "Failed to rename {} to {}: {}",
+                            current_path.display(),
+                            correct_name,
+                            e
+                        ),
+                    );
+                }
             } else {
                 tracing::debug!("Renamed {} to {}", current_path.display(), correct_name);
             }
@@ -245,12 +316,13 @@ pub fn verify_files(
                 });
 
                 if let Some(path) = file_path {
-                    // Perform block-level verification
+                    // Perform block-level verification (no progress callback needed here)
                     match verify_file_blocks(
                         &path,
                         file_info,
                         slice_checksums,
                         par2_data.block_size,
+                        None,
                     ) {
                         Ok(damaged_block_indices) => {
                             let total_blocks = slice_checksums.len();
@@ -258,10 +330,21 @@ pub fn verify_files(
                             if !damaged_block_indices.is_empty() {
                                 tracing::info!(
                                     file = %file_info.name,
-                                    damaged_blocks = damaged_block_indices.len(),
-                                    total_blocks = total_blocks,
-                                    "Block-level damage detected"
+                                    damaged = damaged_block_indices.len(),
+                                    total = total_blocks,
+                                    "Block-level damage"
                                 );
+                                if let Some(ref msg_cb) = message_callback {
+                                    msg_cb(
+                                        MessageLevel::Info,
+                                        &format!(
+                                            "{}: {}/{} blocks damaged",
+                                            file_info.name,
+                                            damaged_block_indices.len(),
+                                            total_blocks
+                                        ),
+                                    );
+                                }
 
                                 let block_damage = BlockDamage {
                                     file_id: *file_id,
@@ -279,11 +362,16 @@ pub fn verify_files(
                             }
                         }
                         Err(e) => {
-                            tracing::warn!(
-                                file = %file_info.name,
-                                error = %e,
-                                "Failed to perform block-level verification"
-                            );
+                            tracing::warn!(file = %file_info.name, error = %e, "Block verification failed");
+                            if let Some(ref msg_cb) = message_callback {
+                                msg_cb(
+                                    MessageLevel::Warning,
+                                    &format!(
+                                        "Block verification failed for {}: {}",
+                                        file_info.name, e
+                                    ),
+                                );
+                            }
                         }
                     }
                 }
@@ -292,6 +380,17 @@ pub fn verify_files(
     }
 
     let all_verified = damaged_files.is_empty() && missing_files.is_empty();
+
+    // Report missing files via message callback
+    if !missing_files.is_empty() {
+        if let Some(ref msg_cb) = message_callback {
+            for file_id in &missing_files {
+                if let Some(file_info) = par2_data.files.get(file_id) {
+                    msg_cb(MessageLevel::Error, &format!("Missing: {}", file_info.name));
+                }
+            }
+        }
+    }
 
     tracing::info!(
         verified = verified_files.len(),
@@ -302,7 +401,7 @@ pub fn verify_files(
     );
 
     if let Some(ref cb) = progress_callback {
-        cb(Par2Operation::Verifying, total_files, total_files);
+        cb(Par2Operation::Verifying, total_bytes, total_bytes);
     }
 
     Ok(VerificationResult {
@@ -314,6 +413,9 @@ pub fn verify_files(
     })
 }
 
+/// Progress callback for intra-file progress reporting
+type ByteProgressCallback<'a> = Option<&'a dyn Fn(u64)>;
+
 /// Verify individual blocks of a file using IFSC checksums
 /// Returns: Vec of damaged block indices (empty = all blocks are good)
 ///
@@ -323,6 +425,7 @@ fn verify_file_blocks(
     file_info: &FileInfo,
     slice_checksums: &[crate::parser::SliceChecksum],
     block_size: u64,
+    byte_progress: ByteProgressCallback<'_>,
 ) -> Result<Vec<usize>> {
     use rayon::prelude::*;
     use std::io::{BufReader, Read, Seek};
@@ -351,6 +454,11 @@ fn verify_file_blocks(
         // Pad last block if needed
         if bytes_read < bytes_to_read {
             batch_data[bytes_read..].fill(0);
+        }
+
+        // Report progress after reading this batch
+        if let Some(cb) = byte_progress {
+            cb(bytes_read as u64);
         }
 
         // Verify blocks in this batch in parallel
@@ -411,6 +519,7 @@ fn verify_file_smart(
     file_info: &FileInfo,
     slice_checksums: Option<&[crate::parser::SliceChecksum]>,
     block_size: u64,
+    byte_progress: ByteProgressCallback<'_>,
 ) -> Result<bool> {
     let mut file = File::open(path)?;
     let metadata = file.metadata()?;
@@ -434,7 +543,8 @@ fn verify_file_smart(
             "Using IFSC block-level verification (skipping full MD5)"
         );
 
-        let damaged_blocks = verify_file_blocks(path, file_info, checksums, block_size)?;
+        let damaged_blocks =
+            verify_file_blocks(path, file_info, checksums, block_size, byte_progress)?;
 
         // If all blocks verified successfully, file is good!
         return Ok(damaged_blocks.is_empty());
@@ -448,19 +558,31 @@ fn verify_file_smart(
 
     // For small files (< 16KB), just do full hash
     if file_info.length < 16384 {
-        return verify_full_hash(&mut file, &file_info.hash);
+        let result = verify_full_hash(&mut file, &file_info.hash);
+        if let Some(cb) = byte_progress {
+            cb(file_info.length);
+        }
+        return result;
     }
 
     // For larger files, first check 16K hash (quick check)
     let hash_16k_matches = verify_16k_hash(&mut file, &file_info.hash_16k)?;
+    if let Some(cb) = byte_progress {
+        cb(16384); // Report 16K progress
+    }
 
     if !hash_16k_matches {
+        // Still report remaining bytes for progress
+        if let Some(cb) = byte_progress {
+            cb(file_info.length - 16384);
+        }
         return Ok(false); // File is damaged
     }
 
     // 16K hash matches, now verify full file hash
     file.seek(SeekFrom::Start(0))?;
-    verify_full_hash(&mut file, &file_info.hash)
+
+    verify_full_hash_with_progress(&mut file, &file_info.hash, byte_progress)
 }
 
 /// Verify first 16KB of file
@@ -481,12 +603,23 @@ fn verify_16k_hash(file: &mut File, expected_hash: &FileHash) -> Result<bool> {
 
 /// Verify full file hash
 fn verify_full_hash(file: &mut File, expected_hash: &FileHash) -> Result<bool> {
+    verify_full_hash_with_progress(file, expected_hash, None)
+}
+
+/// Verify full file hash with progress reporting
+fn verify_full_hash_with_progress(
+    file: &mut File,
+    expected_hash: &FileHash,
+    byte_progress: ByteProgressCallback<'_>,
+) -> Result<bool> {
     use md5::{Digest, Md5};
 
     file.seek(SeekFrom::Start(0))?;
 
     let mut hasher = Md5::new();
     let mut buffer = vec![0u8; 65536]; // 64KB buffer
+    let mut bytes_since_report = 0u64;
+    const REPORT_INTERVAL: u64 = 1024 * 1024; // Report every 1MB
 
     loop {
         let bytes_read = file.read(&mut buffer)?;
@@ -494,6 +627,22 @@ fn verify_full_hash(file: &mut File, expected_hash: &FileHash) -> Result<bool> {
             break;
         }
         hasher.update(&buffer[..bytes_read]);
+
+        // Report progress periodically
+        bytes_since_report += bytes_read as u64;
+        if bytes_since_report >= REPORT_INTERVAL {
+            if let Some(cb) = byte_progress {
+                cb(bytes_since_report);
+            }
+            bytes_since_report = 0;
+        }
+    }
+
+    // Report any remaining bytes
+    if bytes_since_report > 0 {
+        if let Some(cb) = byte_progress {
+            cb(bytes_since_report);
+        }
     }
 
     let hash: [u8; 16] = hasher.finalize().into();

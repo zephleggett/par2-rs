@@ -80,6 +80,18 @@ pub enum Par2Operation {
 /// Progress callback: (operation, current, total)
 pub type ProgressCallback = Arc<dyn Fn(Par2Operation, u64, u64) + Send + Sync>;
 
+/// Message severity level for user-visible messages
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum MessageLevel {
+    Info,
+    Warning,
+    Error,
+}
+
+/// Message callback for user-visible messages: (level, message)
+/// Use this to display messages without breaking progress bars
+pub type MessageCallback = Arc<dyn Fn(MessageLevel, &str) + Send + Sync>;
+
 /// Main PAR2 repair and verification interface
 pub struct Par2Repairer {
     par2_file: PathBuf,
@@ -120,6 +132,27 @@ impl Par2Repairer {
         purge_files: bool,
         progress_callback: Option<ProgressCallback>,
     ) -> Result<()> {
+        self.repair_with_callbacks(do_repair, purge_files, progress_callback, None)
+    }
+
+    /// Perform PAR2 verification and optional repair with message callback
+    ///
+    /// # Arguments
+    /// * `do_repair` - If true, perform repair; if false, only verify
+    /// * `purge_files` - If true, delete PAR2 files after successful repair
+    /// * `progress_callback` - Optional callback for progress updates
+    /// * `message_callback` - Optional callback for user-visible messages
+    ///
+    /// # Returns
+    /// * `Ok(())` - Files were correct or successfully repaired
+    /// * `Err(Par2Error)` - Verification/repair failed
+    pub fn repair_with_callbacks(
+        &self,
+        do_repair: bool,
+        purge_files: bool,
+        progress_callback: Option<ProgressCallback>,
+        message_callback: Option<MessageCallback>,
+    ) -> Result<()> {
         use std::time::Instant;
 
         // Step 1: Load and parse PAR2 file
@@ -153,11 +186,12 @@ impl Par2Repairer {
         }
 
         let verify_start = Instant::now();
-        let verification_result = verify::verify_files(
+        let verification_result = verify::verify_files_with_messages(
             &par2_data,
             &extra_files,
             &self.base_path,
             progress_callback.clone(),
+            message_callback.clone(),
         )?;
         tracing::debug!(
             elapsed_secs = verify_start.elapsed().as_secs_f64(),
@@ -171,11 +205,12 @@ impl Par2Repairer {
             }
 
             let repair_start = Instant::now();
-            repair::repair_files_parallel(
+            repair::repair_files_with_messages(
                 &par2_data,
                 &verification_result,
                 &self.base_path,
                 progress_callback.clone(),
+                message_callback.clone(),
             )?;
             tracing::debug!(
                 elapsed_secs = repair_start.elapsed().as_secs_f64(),

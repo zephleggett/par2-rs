@@ -22,7 +22,7 @@
 
 use super::parser::{FileHash, Par2File};
 use super::verify::VerificationResult;
-use super::{Par2Operation, ProgressCallback};
+use super::{MessageCallback, MessageLevel, Par2Operation, ProgressCallback};
 use crate::error::{Par2Error, Result};
 use crate::par2_rs::Par2ReedSolomon;
 use std::collections::HashMap;
@@ -378,11 +378,29 @@ fn process_chunk(
 }
 
 /// Parallel repair with optimal CPU utilization
+#[allow(dead_code)]
 pub fn repair_files_parallel(
     par2_data: &Par2File,
     verification_result: &VerificationResult,
     base_path: &Path,
     progress_callback: Option<ProgressCallback>,
+) -> Result<()> {
+    repair_files_with_messages(
+        par2_data,
+        verification_result,
+        base_path,
+        progress_callback,
+        None,
+    )
+}
+
+/// Parallel repair with message callback
+pub fn repair_files_with_messages(
+    par2_data: &Par2File,
+    verification_result: &VerificationResult,
+    base_path: &Path,
+    progress_callback: Option<ProgressCallback>,
+    message_callback: Option<MessageCallback>,
 ) -> Result<()> {
     let block_size = par2_data.block_size as usize;
     let file_map = &par2_data.files;
@@ -426,6 +444,12 @@ pub fn repair_files_parallel(
         return Ok(());
     }
 
+    if let Some(ref msg_cb) = message_callback {
+        msg_cb(
+            MessageLevel::Info,
+            &format!("Repairing {} damaged blocks", damaged_block_indices.len()),
+        );
+    }
     tracing::info!(
         damaged_blocks = damaged_block_indices.len(),
         total_blocks,
@@ -470,7 +494,7 @@ pub fn repair_files_parallel(
                     recovery_file_handles.insert(rec_block.file_path.clone(), file);
                 }
                 Err(e) => {
-                    tracing::warn!(
+                    tracing::debug!(
                         path = ?rec_block.file_path,
                         error = %e,
                         "Failed to pre-open recovery file, will fall back to per-read open"
