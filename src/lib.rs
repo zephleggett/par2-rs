@@ -175,6 +175,9 @@ impl Par2Repairer {
 
         let scan_start = Instant::now();
         let extra_files = self.scan_directory(&par2_data.files)?;
+        if let Some(ref cb) = progress_callback {
+            cb(Par2Operation::Scanning, 100, 100);
+        }
         tracing::debug!(
             elapsed_secs = scan_start.elapsed().as_secs_f64(),
             "File scan completed"

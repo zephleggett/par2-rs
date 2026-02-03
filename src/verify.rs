@@ -110,7 +110,7 @@ pub fn verify_files_with_messages(
             let intra_progress = |bytes: u64| {
                 let done = bytes_verified_ref.fetch_add(bytes, Ordering::Relaxed) + bytes;
                 if let Some(ref cb) = progress_callback_ref {
-                    cb(Par2Operation::Verifying, done, total_bytes);
+                    cb(Par2Operation::Verifying, done.min(total_bytes), total_bytes);
                 }
             };
 
@@ -141,6 +141,26 @@ pub fn verify_files_with_messages(
                         );
                     }
                     // Store path so repair can find it
+                    if let Ok(mut files) = verified_files.lock() {
+                        files.insert(**file_id, expected_path);
+                    }
+                    if let Ok(mut files) = damaged_files.lock() {
+                        files.push(**file_id);
+                    }
+                }
+                Err(Par2Error::SizeMismatch {
+                    file: _,
+                    expected: _,
+                    actual: _,
+                }) => {
+                    tracing::warn!(path = %expected_path.display(), "File size mismatch");
+                    if let Some(ref msg_cb) = message_callback {
+                        msg_cb(
+                            MessageLevel::Warning,
+                            &format!("File size mismatch: {}", expected_path.display()),
+                        );
+                    }
+                    // Treat size mismatch as damaged so repair can reuse good blocks
                     if let Ok(mut files) = verified_files.lock() {
                         files.insert(**file_id, expected_path);
                     }
@@ -212,7 +232,7 @@ pub fn verify_files_with_messages(
                 let intra_progress = |bytes: u64| {
                     let done = bytes_verified_ref.fetch_add(bytes, Ordering::Relaxed) + bytes;
                     if let Some(ref cb) = progress_callback_ref {
-                        cb(Par2Operation::Verifying, done, total_bytes);
+                        cb(Par2Operation::Verifying, done.min(total_bytes), total_bytes);
                     }
                 };
 
@@ -449,7 +469,14 @@ fn verify_file_blocks(
         file.seek(SeekFrom::Start(batch_start as u64 * block_size))?;
         let bytes_to_read = batch_size * block_size_usize;
         let mut batch_data = vec![0u8; bytes_to_read];
-        let bytes_read = file.read(&mut batch_data)?;
+        let mut bytes_read = 0usize;
+        while bytes_read < bytes_to_read {
+            let read_now = file.read(&mut batch_data[bytes_read..])?;
+            if read_now == 0 {
+                break;
+            }
+            bytes_read += read_now;
+        }
 
         // Pad last block if needed
         if bytes_read < bytes_to_read {
@@ -526,12 +553,14 @@ fn verify_file_smart(
 
     // Check file size first (quick check)
     if metadata.len() != file_info.length {
-        return Err(Par2Error::RepairFailed(format!(
-            "File size mismatch: {} (expected {}, got {})",
-            path.display(),
-            file_info.length,
-            metadata.len()
-        )));
+        if let Some(cb) = byte_progress {
+            cb(file_info.length);
+        }
+        return Err(Par2Error::SizeMismatch {
+            file: path.display().to_string(),
+            expected: file_info.length,
+            actual: metadata.len(),
+        });
     }
 
     // OPTIMIZATION: If we have IFSC block-level checksums, use them instead of full-file MD5!

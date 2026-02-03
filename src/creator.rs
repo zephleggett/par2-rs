@@ -20,30 +20,45 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 
 /// Calculate optimal block size based on total file size
-/// Optimal block size calculation: target ~2000 blocks with 4MB cap
+/// Optimal block size calculation: target ~2000 blocks with 4MB default cap,
+/// but allow larger blocks if needed to stay within GF(2^16) limits.
 ///
 /// This provides good balance between:
 /// - Recovery granularity (smaller blocks = finer repair control)
 /// - Encoding performance (with SIMD parallelization, more blocks is acceptable)
-/// - Memory usage (4MB cap prevents excessive RAM)
+/// - Memory usage (4MB default cap, but may be exceeded for huge sets)
 fn calculate_block_size(total_size: u64) -> u64 {
     const MIN_BLOCK_SIZE: u64 = 2048; // 2KB
     const MAX_BLOCK_SIZE: u64 = 4 * 1024 * 1024; // 4MB
     const TARGET_BLOCKS: u64 = 2000; // Optimal for performance and memory usage
+    const MAX_BLOCKS: u64 = 65_535; // GF(2^16) limit
 
     if total_size == 0 {
         return MIN_BLOCK_SIZE;
     }
 
     let mut block_size = total_size / TARGET_BLOCKS;
+    let min_for_field = total_size.div_ceil(MAX_BLOCKS);
 
     // Round up to multiple of 4
     if block_size % 4 != 0 {
         block_size = ((block_size / 4) + 1) * 4;
     }
 
-    // Clamp to range
-    block_size = block_size.clamp(MIN_BLOCK_SIZE, MAX_BLOCK_SIZE);
+    // Ensure we don't exceed the GF(2^16) block count limit
+    let mut min_block = min_for_field.max(MIN_BLOCK_SIZE);
+    if min_block % 4 != 0 {
+        min_block = ((min_block / 4) + 1) * 4;
+    }
+
+    if min_block > MAX_BLOCK_SIZE {
+        // For very large data sets, allow block sizes larger than the usual cap
+        block_size = min_block;
+    } else {
+        // Clamp to default range
+        block_size = block_size.clamp(MIN_BLOCK_SIZE, MAX_BLOCK_SIZE);
+        block_size = block_size.max(min_block);
+    }
 
     // Ensure it's a multiple of 4
     assert_eq!(block_size % 4, 0);
@@ -171,6 +186,11 @@ impl Par2Creator {
                 "Block size cannot be zero".to_string(),
             ));
         }
+        if size > (usize::MAX as u64) {
+            return Err(Par2Error::InvalidFormat(
+                "Block size exceeds platform limits".to_string(),
+            ));
+        }
         if size < MIN_BLOCK_SIZE {
             return Err(Par2Error::InvalidFormat(format!(
                 "Block size must be at least {} bytes (got {})",
@@ -207,6 +227,7 @@ impl Par2Creator {
     /// Create PAR2 files using streaming (memory-efficient)
     pub fn create(&self) -> Result<Vec<PathBuf>> {
         use md5::{Digest, Md5};
+        const MAX_BLOCKS: usize = 65_535;
 
         tracing::info!(
             input_files = self.input_files.len(),
@@ -221,22 +242,63 @@ impl Par2Creator {
         let block_size = self
             .block_size
             .unwrap_or_else(|| calculate_block_size(total_size));
+        if block_size == 0 {
+            return Err(Par2Error::InvalidFormat(
+                "Block size cannot be zero".to_string(),
+            ));
+        }
+        if block_size > (usize::MAX as u64) {
+            return Err(Par2Error::InvalidFormat(
+                "Block size exceeds platform limits".to_string(),
+            ));
+        }
         tracing::info!(block_size, total_size, "Calculated block size");
 
         // Count total blocks across all files
         let mut num_data_blocks = 0usize;
         let mut file_block_counts = Vec::new();
         for meta in &file_metadata {
-            let blocks = meta.length.div_ceil(block_size) as usize;
+            let blocks_u64 = meta.length.div_ceil(block_size);
+            let blocks = usize::try_from(blocks_u64).map_err(|_| {
+                Par2Error::InvalidFormat(format!("File requires too many blocks: {}", meta.name))
+            })?;
             file_block_counts.push(blocks);
-            num_data_blocks += blocks;
+            num_data_blocks = num_data_blocks
+                .checked_add(blocks)
+                .ok_or_else(|| Par2Error::InvalidFormat("Too many total blocks".to_string()))?;
+        }
+        if num_data_blocks > MAX_BLOCKS {
+            return Err(Par2Error::InvalidFormat(format!(
+                "Total data blocks ({}) exceed GF(2^16) limit ({})",
+                num_data_blocks, MAX_BLOCKS
+            )));
         }
 
         // Step 2: Calculate number of recovery blocks
-        let data_bytes = (num_data_blocks as u64) * block_size;
+        let data_bytes = (num_data_blocks as u64)
+            .checked_mul(block_size)
+            .ok_or_else(|| Par2Error::InvalidFormat("Data size overflow".to_string()))?;
         let recovery_bytes =
             ((data_bytes as f64) * (self.redundancy_percent as f64 / 100.0)) as u64;
-        let num_recovery_blocks = recovery_bytes.div_ceil(block_size) as usize;
+        let num_recovery_blocks_u64 = recovery_bytes.div_ceil(block_size);
+        let num_recovery_blocks = usize::try_from(num_recovery_blocks_u64)
+            .map_err(|_| Par2Error::InvalidFormat("Too many recovery blocks".to_string()))?;
+        if num_recovery_blocks > MAX_BLOCKS {
+            return Err(Par2Error::InvalidFormat(format!(
+                "Recovery blocks ({}) exceed GF(2^16) limit ({})",
+                num_recovery_blocks, MAX_BLOCKS
+            )));
+        }
+        if num_data_blocks
+            .checked_add(num_recovery_blocks)
+            .ok_or_else(|| Par2Error::InvalidFormat("Block count overflow".to_string()))?
+            > MAX_BLOCKS
+        {
+            return Err(Par2Error::InvalidFormat(format!(
+                "Total blocks (data + recovery) exceed GF(2^16) limit ({})",
+                MAX_BLOCKS
+            )));
+        }
 
         tracing::info!(
             data_blocks = num_data_blocks,

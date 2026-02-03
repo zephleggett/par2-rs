@@ -185,6 +185,11 @@ impl Par2File {
     ) -> Result<Self> {
         let mut file = File::open(path)?;
         let file_size = file.metadata()?.len();
+        if file_size == 0 {
+            return Err(Par2Error::InvalidFormat(
+                "Invalid PAR2 file: empty file".to_string(),
+            ));
+        }
 
         let mut recovery_set_id = [0u8; 16];
         let mut block_size = 0u64;
@@ -230,21 +235,41 @@ impl Par2File {
                 header[15],
             ]);
 
+            let remaining = file_size.saturating_sub(position);
+            // Validate packet length to avoid infinite loops on corrupt data
+            if packet_length < 64 || packet_length > remaining {
+                position = position.saturating_add(1);
+                continue;
+            }
+
+            // Ensure packet length is representable on this platform for allocations
+            if packet_length > (usize::MAX as u64) {
+                return Err(Par2Error::InvalidFormat(
+                    "Packet length exceeds platform limits".to_string(),
+                ));
+            }
+
             // Read packet type (16 bytes at offset 48)
             let mut packet_type_bytes = [0u8; 16];
             packet_type_bytes.copy_from_slice(&header[48..64]);
             let packet_type = PacketType::from_bytes(&packet_type_bytes);
 
-            // Validate packet length
-            if packet_length > 100_000_000 {
-                // Skip suspiciously large packets (>100MB)
-                position += packet_length;
-                continue;
-            }
-
             // Optimize memory: For RecoverySlice packets, only read exponent (4 bytes)
             // The actual recovery data will be read on-demand during repair
             if packet_type == PacketType::RecoverySlice {
+                if block_size == 0 {
+                    // Can't parse recovery blocks until we know the block size
+                    position += packet_length;
+                    if packet_length % 4 != 0 {
+                        position += 4 - (packet_length % 4);
+                    }
+                    continue;
+                }
+                if packet_length < 68 {
+                    // RecoverySlice must include exponent bytes
+                    position = position.saturating_add(1);
+                    continue;
+                }
                 // Read only the exponent (first 4 bytes of body)
                 let mut exponent_bytes = [0u8; 4];
                 if file.read(&mut exponent_bytes)? == 4 {
@@ -338,6 +363,27 @@ impl Par2File {
             ));
         }
 
+        if block_size == 0 {
+            return Err(Par2Error::InvalidFormat(
+                "Invalid PAR2 file: block size missing or zero".to_string(),
+            ));
+        }
+        if block_size % 4 != 0 {
+            return Err(Par2Error::InvalidFormat(
+                "Invalid PAR2 file: block size must be multiple of 4".to_string(),
+            ));
+        }
+        if block_size % 2 != 0 {
+            return Err(Par2Error::InvalidFormat(
+                "Invalid PAR2 file: block size must be multiple of 2".to_string(),
+            ));
+        }
+        if block_size > (usize::MAX as u64) {
+            return Err(Par2Error::InvalidFormat(
+                "Invalid PAR2 file: block size exceeds platform limits".to_string(),
+            ));
+        }
+
         // Load additional PAR2 volumes if they exist
         // IMPORTANT: Match by recovery_set_id, not filename (for obfuscated Usenet files!)
         tracing::debug!("Scanning for volume files in {:?}", path.parent());
@@ -421,6 +467,10 @@ impl Par2File {
                     "Volume scan complete"
                 );
             }
+        }
+
+        if let Some(ref cb) = progress_callback {
+            cb(super::Par2Operation::Loading, 100, 100);
         }
 
         Ok(Self {
@@ -601,6 +651,21 @@ fn parse_volume_file(
     block_size: u64,
     _progress_callback: Option<super::ProgressCallback>,
 ) -> Result<Vec<RecoveryBlock>> {
+    if block_size == 0 {
+        return Err(Par2Error::InvalidFormat(
+            "Invalid PAR2 volume: block size missing or zero".to_string(),
+        ));
+    }
+    if block_size % 4 != 0 || block_size % 2 != 0 {
+        return Err(Par2Error::InvalidFormat(
+            "Invalid PAR2 volume: block size not aligned".to_string(),
+        ));
+    }
+    if block_size > (usize::MAX as u64) {
+        return Err(Par2Error::InvalidFormat(
+            "Invalid PAR2 volume: block size exceeds platform limits".to_string(),
+        ));
+    }
     let mut file = File::open(path)?;
     let file_size = file.metadata()?.len();
     let mut recovery_blocks = Vec::new();
@@ -623,6 +688,16 @@ fn parse_volume_file(
             header[8], header[9], header[10], header[11], header[12], header[13], header[14],
             header[15],
         ]);
+        let remaining = file_size.saturating_sub(position);
+        if packet_length < 64 || packet_length > remaining {
+            position = position.saturating_add(1);
+            continue;
+        }
+        if packet_length > (usize::MAX as u64) {
+            return Err(Par2Error::InvalidFormat(
+                "Packet length exceeds platform limits".to_string(),
+            ));
+        }
 
         let mut packet_type_bytes = [0u8; 16];
         packet_type_bytes.copy_from_slice(&header[48..64]);
@@ -633,8 +708,8 @@ fn parse_volume_file(
                 "Found RecoverySlice packet, packet_length={}",
                 packet_length
             );
-            // Memory-efficient: Only read exponent (4 bytes), not the full recovery data
-            if packet_length <= 100_000_000 {
+            if packet_length >= 68 {
+                // Memory-efficient: Only read exponent (4 bytes), not the full recovery data
                 let mut exponent_bytes = [0u8; 4];
                 if file.read(&mut exponent_bytes)? == 4 {
                     let data_file_offset = position + 64;
@@ -651,7 +726,7 @@ fn parse_volume_file(
                     tracing::warn!("Failed to read exponent");
                 }
             } else {
-                tracing::warn!("Packet length too large: {}", packet_length);
+                tracing::warn!("RecoverySlice packet too small: {}", packet_length);
             }
         }
 

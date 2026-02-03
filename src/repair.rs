@@ -33,6 +33,7 @@ use std::io::{Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 // Thread-local file handle cache for Windows
@@ -45,6 +46,7 @@ use std::cell::UnsafeCell;
 use std::sync::Once;
 
 static RAYON_INIT: Once = Once::new();
+const MAX_BLOCKS: usize = 65_535;
 
 /// Initialize rayon thread pool with container-aware CPU count
 fn init_rayon_pool() {
@@ -216,7 +218,7 @@ fn process_chunk(
         if block_idx < total_blocks {
             // Data block - read from file
             if let Some(&(file_id, block_in_file)) = block_to_file.get(&block_idx) {
-                let block_byte_offset = (block_in_file * block_size) as u64;
+                let block_byte_offset = (block_in_file as u64) * (block_size as u64);
                 let chunk_byte_offset = block_byte_offset + offset as u64;
                 let mut buffer = get_pooled_buffer(size);
 
@@ -402,6 +404,21 @@ pub fn repair_files_with_messages(
     progress_callback: Option<ProgressCallback>,
     message_callback: Option<MessageCallback>,
 ) -> Result<()> {
+    if par2_data.block_size == 0 {
+        return Err(Par2Error::InvalidFormat(
+            "Invalid PAR2 data: block size is zero".to_string(),
+        ));
+    }
+    if par2_data.block_size % 4 != 0 || par2_data.block_size % 2 != 0 {
+        return Err(Par2Error::InvalidFormat(
+            "Invalid PAR2 data: block size not aligned".to_string(),
+        ));
+    }
+    if par2_data.block_size > (usize::MAX as u64) {
+        return Err(Par2Error::InvalidFormat(
+            "Invalid PAR2 data: block size exceeds platform limits".to_string(),
+        ));
+    }
     let block_size = par2_data.block_size as usize;
     let file_map = &par2_data.files;
 
@@ -410,9 +427,37 @@ pub fn repair_files_with_messages(
     let mut file_block_map: HashMap<FileHash, (usize, usize)> = HashMap::new();
 
     for file_info in &par2_data.files_in_order {
-        let num_blocks = file_info.length.div_ceil(par2_data.block_size) as usize;
+        let num_blocks_u64 = file_info.length.div_ceil(par2_data.block_size);
+        let num_blocks = usize::try_from(num_blocks_u64).map_err(|_| {
+            Par2Error::InvalidFormat(format!("File requires too many blocks: {}", file_info.name))
+        })?;
         file_block_map.insert(file_info.file_id, (total_blocks, num_blocks));
-        total_blocks += num_blocks;
+        total_blocks = total_blocks
+            .checked_add(num_blocks)
+            .ok_or_else(|| Par2Error::InvalidFormat("Too many total blocks".to_string()))?;
+    }
+    if total_blocks > MAX_BLOCKS {
+        return Err(Par2Error::InvalidFormat(format!(
+            "Total data blocks ({}) exceed GF(2^16) limit ({})",
+            total_blocks, MAX_BLOCKS
+        )));
+    }
+    let total_recovery_count = par2_data.recovery_blocks.len();
+    if total_recovery_count > MAX_BLOCKS {
+        return Err(Par2Error::InvalidFormat(format!(
+            "Recovery blocks ({}) exceed GF(2^16) limit ({})",
+            total_recovery_count, MAX_BLOCKS
+        )));
+    }
+    if total_blocks
+        .checked_add(total_recovery_count)
+        .ok_or_else(|| Par2Error::InvalidFormat("Block count overflow".to_string()))?
+        > MAX_BLOCKS
+    {
+        return Err(Par2Error::InvalidFormat(format!(
+            "Total blocks (data + recovery) exceed GF(2^16) limit ({})",
+            MAX_BLOCKS
+        )));
     }
 
     // Identify damaged blocks
@@ -444,6 +489,13 @@ pub fn repair_files_with_messages(
         return Ok(());
     }
 
+    if damaged_block_indices.len() > par2_data.recovery_blocks.len() {
+        return Err(Par2Error::InsufficientRecovery {
+            needed: damaged_block_indices.len(),
+            available: par2_data.recovery_blocks.len(),
+        });
+    }
+
     if let Some(ref msg_cb) = message_callback {
         msg_cb(
             MessageLevel::Info,
@@ -456,16 +508,12 @@ pub fn repair_files_with_messages(
         "Starting parallel repair"
     );
 
-    if let Some(ref cb) = progress_callback {
-        cb(Par2Operation::Repairing, 0, total_blocks as u64);
-    }
-
     // Sort recovery blocks by exponent
     let mut recovery_indices: Vec<usize> = (0..par2_data.recovery_blocks.len()).collect();
     recovery_indices.sort_by_key(|&i| par2_data.recovery_blocks[i].exponent);
 
     // Only use as many recovery blocks as we have damaged blocks
-    let num_recovery_needed = damaged_block_indices.len().min(recovery_indices.len());
+    let num_recovery_needed = damaged_block_indices.len();
     let recovery_exponents: Vec<u32> = recovery_indices
         .iter()
         .take(num_recovery_needed)
@@ -510,7 +558,6 @@ pub fn repair_files_with_messages(
     );
 
     // Create Reed-Solomon codec with full recovery count for proper matrix dimensions
-    let total_recovery_count = par2_data.recovery_blocks.len();
     let rs = Arc::new(Par2ReedSolomon::new(total_blocks, total_recovery_count));
 
     // Chunk size calculation inspired by par2cmdline-turbo
@@ -556,6 +603,12 @@ pub fn repair_files_with_messages(
     let chunk_size = (chunk_size / 2) * 2; // Ensure even for u16 alignment
     let chunk_size = chunk_size.max(2); // Ensure at least 2 bytes for u16 alignment
     let num_chunks = block_size.div_ceil(chunk_size);
+    let total_chunks = num_chunks as u64;
+    let report_every = (total_chunks / 100).max(1);
+
+    if let Some(ref cb) = progress_callback {
+        cb(Par2Operation::Repairing, 0, total_chunks);
+    }
 
     let num_damaged = damaged_block_indices.len();
     tracing::info!(
@@ -643,6 +696,10 @@ pub fn repair_files_with_messages(
         if let Some(file_info) = file_map.get(file_id) {
             let file_path = base_path.join(&file_info.name);
             let file = OpenOptions::new().read(true).write(true).open(&file_path)?;
+            let actual_len = file.metadata()?.len();
+            if actual_len != file_info.length {
+                file.set_len(file_info.length)?;
+            }
             output_files.insert(*file_id, file);
             // Open separate read-only handle to enable read_at in parallel
             #[cfg(unix)]
@@ -673,9 +730,13 @@ pub fn repair_files_with_messages(
     );
 
     // Prepare indices for streaming API
-    let present_recovery_indices: Vec<usize> = (0..recovery_blocks.len())
-        .map(|i| total_blocks + i)
-        .collect();
+    let mut present_recovery_indices: Vec<usize> = Vec::with_capacity(recovery_blocks.len());
+    for i in 0..recovery_blocks.len() {
+        let idx = total_blocks
+            .checked_add(i)
+            .ok_or_else(|| Par2Error::InvalidFormat("Recovery index overflow".to_string()))?;
+        present_recovery_indices.push(idx);
+    }
 
     // CRITICAL: Compute Gaussian elimination transformation ONCE for all chunks
     // This is the key optimization - avoid O(m³) work per chunk!
@@ -721,6 +782,8 @@ pub fn repair_files_with_messages(
     // Static distribution: divide chunks evenly across threads
     let chunks_per_thread = num_chunks.div_ceil(num_threads);
 
+    let chunks_done = Arc::new(AtomicU64::new(0));
+    let progress_callback = progress_callback.clone();
     rayon::scope(|s| {
         for thread_id in 0..num_threads {
             let start = thread_id * chunks_per_thread;
@@ -742,6 +805,8 @@ pub fn repair_files_with_messages(
             let present_recovery_indices = &present_recovery_indices;
             let transform = &transform;
             let results_wrapper = &results_wrapper;
+            let progress_callback = progress_callback.clone();
+            let chunks_done = Arc::clone(&chunks_done);
 
             // Each thread gets exactly one task - processes contiguous range of chunks
             s.spawn(move |_| {
@@ -766,6 +831,12 @@ pub fn repair_files_with_messages(
                     unsafe {
                         *results_wrapper.0[chunk_idx].get() = Some(result);
                     }
+                    if let Some(ref cb) = progress_callback {
+                        let done = chunks_done.fetch_add(1, Ordering::Relaxed) + 1;
+                        if done == total_chunks || done % report_every == 0 {
+                            cb(Par2Operation::Repairing, done, total_chunks);
+                        }
+                    }
                 }
             });
         }
@@ -782,7 +853,7 @@ pub fn repair_files_with_messages(
             if let Some(&(file_id, block_in_file)) = block_to_file.get(&block_idx) {
                 if let Some(file) = output_files.get_mut(&file_id) {
                     if let Some(file_info) = file_map.get(&file_id) {
-                        let block_byte_offset = (block_in_file * block_size) as u64;
+                        let block_byte_offset = (block_in_file as u64) * (block_size as u64);
                         let write_offset = block_byte_offset + chunk_offset;
 
                         file.seek(SeekFrom::Start(write_offset))?;
@@ -833,11 +904,7 @@ pub fn repair_files_with_messages(
     );
 
     if let Some(ref cb) = progress_callback {
-        cb(
-            Par2Operation::Repairing,
-            damaged_block_indices.len() as u64,
-            damaged_block_indices.len() as u64,
-        );
+        cb(Par2Operation::Repairing, total_chunks, total_chunks);
     }
 
     Ok(())
