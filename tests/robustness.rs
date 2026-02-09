@@ -18,6 +18,7 @@ use common::{compute_file_hash, corrupt_file, create_pattern_file};
 
 /// Test create → corrupt → repair cycle with a 10MB file
 #[test]
+#[ignore] // Slow under tarpaulin coverage instrumentation
 fn test_large_single_file_10mb() {
     let temp = TempDir::new().unwrap();
     let file = temp.path().join("large.bin");
@@ -53,6 +54,7 @@ fn test_large_single_file_10mb() {
 
 /// Test with a deleted large file (full reconstruction)
 #[test]
+#[ignore] // Slow under tarpaulin coverage instrumentation
 fn test_large_file_full_reconstruction() {
     let temp = TempDir::new().unwrap();
     let file = temp.path().join("data.bin");
