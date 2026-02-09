@@ -202,6 +202,7 @@ impl Par2Repairer {
         );
 
         // Step 4: Repair if needed and requested
+        let repair_succeeded;
         if !verification_result.all_verified && do_repair {
             if let Some(ref cb) = progress_callback {
                 cb(Par2Operation::Repairing, 0, 100);
@@ -219,14 +220,45 @@ impl Par2Repairer {
                 elapsed_secs = repair_start.elapsed().as_secs_f64(),
                 "Repair completed"
             );
+
+            // Step 4b: Verify repaired files to confirm repair success
+            if let Some(ref msg_cb) = message_callback {
+                msg_cb(MessageLevel::Info, "Verifying repaired files...");
+            }
+            let verify_start2 = Instant::now();
+            let post_repair_result = verify::verify_files_with_messages(
+                &par2_data,
+                &extra_files,
+                &self.base_path,
+                None, // Don't report progress for post-repair verify (it's fast)
+                message_callback.clone(),
+            )?;
+            tracing::debug!(
+                elapsed_secs = verify_start2.elapsed().as_secs_f64(),
+                "Post-repair verification completed"
+            );
+
+            if !post_repair_result.all_verified {
+                return Err(Par2Error::RepairFailed(
+                    "Repair completed but verification failed - files may still be damaged"
+                        .to_string(),
+                ));
+            }
+
+            if let Some(ref msg_cb) = message_callback {
+                msg_cb(MessageLevel::Info, "Repair successful - all files verified");
+            }
+            repair_succeeded = true;
         } else if !verification_result.all_verified {
             return Err(Par2Error::RepairFailed(
                 "Files are damaged and repair was not requested".to_string(),
             ));
+        } else {
+            repair_succeeded = false;
         }
 
-        // Step 5: Purge PAR2 files if requested
-        if purge_files && verification_result.all_verified {
+        // Step 5: Purge PAR2 files if requested (after verification OR successful repair)
+        if purge_files && (verification_result.all_verified || repair_succeeded) {
             self.purge_par2_files()?;
         }
 

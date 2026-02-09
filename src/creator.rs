@@ -141,6 +141,8 @@ pub struct Par2Creator {
     block_size: Option<u64>,
     redundancy_percent: f32,
     volume_scheme: VolumeScheme,
+    progress_callback: Option<crate::ProgressCallback>,
+    message_callback: Option<crate::MessageCallback>,
 }
 
 impl Par2Creator {
@@ -174,6 +176,8 @@ impl Par2Creator {
             block_size: None,
             redundancy_percent: 5.0,
             volume_scheme: VolumeScheme::Exponential,
+            progress_callback: None,
+            message_callback: None,
         })
     }
 
@@ -221,6 +225,21 @@ impl Par2Creator {
     /// Set volume splitting scheme
     pub fn with_volume_scheme(mut self, scheme: VolumeScheme) -> Self {
         self.volume_scheme = scheme;
+        self
+    }
+
+    /// Set progress callback for creation progress
+    ///
+    /// The callback receives (operation, current, total) where operation is
+    /// `Par2Operation::Loading` during hashing and `Par2Operation::Repairing` during encoding.
+    pub fn with_progress_callback(mut self, callback: crate::ProgressCallback) -> Self {
+        self.progress_callback = Some(callback);
+        self
+    }
+
+    /// Set message callback for status messages during creation
+    pub fn with_message_callback(mut self, callback: crate::MessageCallback) -> Self {
+        self.message_callback = Some(callback);
         self
     }
 
@@ -321,6 +340,11 @@ impl Par2Creator {
         let mut file_infos = Vec::new();
         let mut slice_checksums_map = std::collections::HashMap::new();
         let mut global_block_idx = 0usize;
+        let total_data_blocks_u64 = num_data_blocks as u64;
+
+        if let Some(ref cb) = self.progress_callback {
+            cb(crate::Par2Operation::Repairing, 0, total_data_blocks_u64);
+        }
 
         for (file_idx, meta) in file_metadata.iter().enumerate() {
             let mut file = File::open(&meta.path)?;
@@ -367,6 +391,15 @@ impl Par2Creator {
                 encoder.process_block(global_block_idx, &block_u16);
 
                 global_block_idx += 1;
+
+                // Report progress per block
+                if let Some(ref cb) = self.progress_callback {
+                    cb(
+                        crate::Par2Operation::Repairing,
+                        global_block_idx as u64,
+                        total_data_blocks_u64,
+                    );
+                }
             }
 
             // Use pre-computed file hashes from parallel pass
@@ -489,16 +522,45 @@ mod tests {
         assert_eq!(calculate_block_size(10_000_000), 5000); // 10MB -> 5KB
         assert_eq!(calculate_block_size(1_000_000_000), 500_000); // 1GB -> 500KB
 
-        // Verify all results are multiples of 4
-        for size in [0, 1000, 1_000_000, 100_000_000, 10_000_000_000] {
+        // Verify all results are multiples of 4 and stay within GF(2^16) block limit
+        for size in [0, 1000, 1_000_000, 100_000_000, 10_000_000_000u64] {
             let block_size = calculate_block_size(size);
             assert_eq!(block_size % 4, 0, "Block size must be multiple of 4");
             assert!(block_size >= 2048, "Block size must be at least 2KB");
-            assert!(
-                block_size <= 4 * 1024 * 1024,
-                "Block size must be at most 4MB"
-            );
+            // For normal sizes (<=260GB), block size should be at most 4MB
+            // For very large data sets, block sizes can exceed 4MB to stay within GF(2^16) limits
+            if size <= 260_000_000_000 {
+                assert!(
+                    block_size <= 4 * 1024 * 1024,
+                    "Block size should be at most 4MB for data size {}, got {}",
+                    size,
+                    block_size
+                );
+            }
+            // Always verify we stay within GF(2^16) block count limit
+            if size > 0 {
+                let num_blocks = size.div_ceil(block_size);
+                assert!(
+                    num_blocks <= 65_535,
+                    "Block count {} exceeds GF(2^16) limit for data size {} with block size {}",
+                    num_blocks,
+                    size,
+                    block_size
+                );
+            }
         }
+
+        // Test very large data sets that require block sizes > 4MB
+        let huge_size = 500_000_000_000u64; // 500GB
+        let block_size = calculate_block_size(huge_size);
+        assert_eq!(block_size % 4, 0, "Block size must be multiple of 4");
+        assert!(block_size >= 2048, "Block size must be at least 2KB");
+        let num_blocks = huge_size.div_ceil(block_size);
+        assert!(
+            num_blocks <= 65_535,
+            "500GB should produce at most 65535 blocks, got {}",
+            num_blocks
+        );
     }
 
     #[test]

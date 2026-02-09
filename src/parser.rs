@@ -199,7 +199,9 @@ impl Par2File {
         let mut slice_checksums: HashMap<FileHash, Vec<SliceChecksum>> = HashMap::new();
 
         let mut position = 0u64;
-        let _packet_count = 0u64;
+        // Track recovery slice positions found before the Main packet
+        // so we can re-parse them once block_size is known
+        let mut deferred_recovery_positions: Vec<(u64, u64)> = Vec::new(); // (position, packet_length)
 
         // Read packets until end of file
         while position < file_size {
@@ -207,7 +209,11 @@ impl Par2File {
 
             // Update progress
             if let Some(ref cb) = progress_callback {
-                let progress = (position * 100 / file_size).min(100);
+                let progress = if file_size > 0 {
+                    (position * 100 / file_size).min(100)
+                } else {
+                    100
+                };
                 cb(super::Par2Operation::Loading, progress, 100);
             }
 
@@ -258,7 +264,8 @@ impl Par2File {
             // The actual recovery data will be read on-demand during repair
             if packet_type == PacketType::RecoverySlice {
                 if block_size == 0 {
-                    // Can't parse recovery blocks until we know the block size
+                    // Defer parsing until we know block_size (Main packet not yet seen)
+                    deferred_recovery_positions.push((position, packet_length));
                     position += packet_length;
                     if packet_length % 4 != 0 {
                         position += 4 - (packet_length % 4);
@@ -373,15 +380,36 @@ impl Par2File {
                 "Invalid PAR2 file: block size must be multiple of 4".to_string(),
             ));
         }
-        if block_size % 2 != 0 {
-            return Err(Par2Error::InvalidFormat(
-                "Invalid PAR2 file: block size must be multiple of 2".to_string(),
-            ));
-        }
         if block_size > (usize::MAX as u64) {
             return Err(Par2Error::InvalidFormat(
                 "Invalid PAR2 file: block size exceeds platform limits".to_string(),
             ));
+        }
+
+        // Re-parse any recovery blocks that appeared before the Main packet
+        if !deferred_recovery_positions.is_empty() {
+            tracing::debug!(
+                count = deferred_recovery_positions.len(),
+                "Re-parsing deferred recovery blocks (appeared before Main packet)"
+            );
+            for (rec_pos, rec_len) in &deferred_recovery_positions {
+                if *rec_len < 68 {
+                    continue;
+                }
+                file.seek(SeekFrom::Start(*rec_pos + 64))?; // Skip header, read body
+                let mut exponent_bytes = [0u8; 4];
+                if file.read(&mut exponent_bytes)? == 4 {
+                    let data_file_offset = *rec_pos + 64;
+                    if let Some(recovery) = parse_recovery_from_body_minimal(
+                        &exponent_bytes,
+                        block_size,
+                        path,
+                        data_file_offset,
+                    ) {
+                        recovery_blocks.push(recovery);
+                    }
+                }
+            }
         }
 
         // Load additional PAR2 volumes if they exist

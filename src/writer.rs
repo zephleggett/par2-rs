@@ -149,8 +149,17 @@ pub fn write_main_packet(
     // Write block size
     body.extend_from_slice(&block_size.to_le_bytes());
 
-    // Write file count
-    let file_count = file_ids.len() as u32;
+    // Write file count (PAR2 spec uses u32)
+    let file_count = u32::try_from(file_ids.len()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "Too many files ({}) - PAR2 format supports at most {} files",
+                file_ids.len(),
+                u32::MAX
+            ),
+        )
+    })?;
     body.extend_from_slice(&file_count.to_le_bytes());
 
     // Write sorted file IDs

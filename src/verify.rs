@@ -160,6 +160,12 @@ pub fn verify_files_with_messages(
                             &format!("File size mismatch: {}", expected_path.display()),
                         );
                     }
+                    // Account for this file's bytes in progress (file wasn't read but we're done with it)
+                    let done = bytes_verified_ref.fetch_add(file_info.length, Ordering::Relaxed)
+                        + file_info.length;
+                    if let Some(ref cb) = progress_callback_ref {
+                        cb(Par2Operation::Verifying, done.min(total_bytes), total_bytes);
+                    }
                     // Treat size mismatch as damaged so repair can reuse good blocks
                     if let Ok(mut files) = verified_files.lock() {
                         files.insert(**file_id, expected_path);
@@ -173,6 +179,12 @@ pub fn verify_files_with_messages(
                         path = %expected_path.display(),
                         "Error reading file by name"
                     );
+                    // Account for this file's bytes in progress even on error
+                    let done = bytes_verified_ref.fetch_add(file_info.length, Ordering::Relaxed)
+                        + file_info.length;
+                    if let Some(ref cb) = progress_callback_ref {
+                        cb(Par2Operation::Verifying, done.min(total_bytes), total_bytes);
+                    }
                 }
             }
         }
@@ -315,6 +327,14 @@ pub fn verify_files_with_messages(
     for file_id in par2_data.files.keys() {
         if !verified_files.contains_key(file_id) && !damaged_files.iter().any(|id| id == file_id) {
             missing_files.push(*file_id);
+            // Account for missing file's bytes in progress (nothing to read)
+            if let Some(file_info) = par2_data.files.get(file_id) {
+                let done = bytes_verified.fetch_add(file_info.length, Ordering::Relaxed)
+                    + file_info.length;
+                if let Some(ref cb) = progress_callback {
+                    cb(Par2Operation::Verifying, done.min(total_bytes), total_bytes);
+                }
+            }
         }
     }
 
@@ -553,9 +573,8 @@ fn verify_file_smart(
 
     // Check file size first (quick check)
     if metadata.len() != file_info.length {
-        if let Some(cb) = byte_progress {
-            cb(file_info.length);
-        }
+        // Report 0 bytes: the file wasn't actually read/verified
+        // The caller is responsible for accounting for unverified bytes
         return Err(Par2Error::SizeMismatch {
             file: path.display().to_string(),
             expected: file_info.length,
