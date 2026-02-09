@@ -2,6 +2,10 @@
 # Quick repair benchmark - 100MB file for fast iteration
 set -e
 
+# Get the directory where this script is located
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
 cd /tmp
 rm -rf quick_par2_bench && mkdir quick_par2_bench && cd quick_par2_bench
 
@@ -13,15 +17,15 @@ ORIG_MD5=$(md5sum test.bin | cut -d' ' -f1)
 echo "Original MD5: $ORIG_MD5"
 
 # Download turbo if needed
-if [ ! -f /home/zeph/par2cmdline-turbo/par2 ]; then
+if [ ! -f "$HOME/par2cmdline-turbo/par2" ]; then
     echo "Downloading par2cmdline-turbo..."
-    mkdir -p /home/zeph/par2cmdline-turbo
-    curl -sL https://github.com/animetosho/par2cmdline-turbo/releases/download/v1.2.0/par2cmdline-turbo-v1.2.0-linux-amd64.tar.xz | tar -xJ -C /home/zeph/par2cmdline-turbo --strip-components=1
+    mkdir -p "$HOME/par2cmdline-turbo"
+    curl -sL https://github.com/animetosho/par2cmdline-turbo/releases/download/v1.2.0/par2cmdline-turbo-v1.2.0-linux-amd64.tar.xz | tar -xJ -C "$HOME/par2cmdline-turbo" --strip-components=1
 fi
 
 # Create PAR2 with turbo (10% redundancy)
 echo "Creating PAR2 files..."
-/home/zeph/par2cmdline-turbo/par2 create -r10 -n1 test.par2 test.bin >/dev/null 2>&1
+"$HOME/par2cmdline-turbo/par2" create -r10 -n1 test.par2 test.bin >/dev/null 2>&1
 
 # Setup test directories with CLEAN copies first
 echo "Setting up test directories..."
@@ -41,7 +45,7 @@ dd if=corrupt_data of=rs_test/test.bin conv=notrunc 2>/dev/null
 echo "Running par2cmdline-turbo repair..."
 cd turbo_test
 TURBO_START=$(date +%s.%N)
-/home/zeph/par2cmdline-turbo/par2 repair test.par2 >/dev/null 2>&1
+"$HOME/par2cmdline-turbo/par2" repair test.par2 >/dev/null 2>&1
 TURBO_END=$(date +%s.%N)
 TURBO_TIME=$(echo "$TURBO_END - $TURBO_START" | bc)
 cd ..
@@ -60,7 +64,7 @@ echo "turbo verification OK"
 echo "Running par2-rs repair..."
 cd rs_test
 RS_START=$(date +%s.%N)
-/home/zeph/par2-rs/target/release/repair test.par2 >/dev/null 2>&1
+"$PROJECT_ROOT/target/release/repair" test.par2 >/dev/null 2>&1
 RS_END=$(date +%s.%N)
 RS_TIME=$(echo "$RS_END - $RS_START" | bc)
 cd ..
