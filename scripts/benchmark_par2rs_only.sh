@@ -16,6 +16,10 @@ ok()    { echo -e "${GREEN}$*${NC}"; }
 warn()  { echo -e "${YELLOW}$*${NC}"; }
 err()   { echo -e "${RED}$*${NC}"; }
 
+# Get the directory where this script is located
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
 TMPDIR=$(mktemp -d)
 trap 'rm -rf "$TMPDIR"' EXIT INT TERM
 cd "$TMPDIR"
@@ -24,7 +28,7 @@ info "par2-rs only benchmark (1GB)"
 echo
 
 # Locate par2-rs binaries
-PAR2_RS_BIN_DIR="${PAR2_RS_BIN_DIR:-$HOME/par2-rs/target/release}"
+PAR2_RS_BIN_DIR="${PAR2_RS_BIN_DIR:-$PROJECT_ROOT/target/release}"
 PAR2_RS_CREATE="$PAR2_RS_BIN_DIR/create"
 PAR2_RS_REPAIR="$PAR2_RS_BIN_DIR/repair"
 
@@ -34,7 +38,7 @@ if [[ ! -x "$PAR2_RS_CREATE" || ! -x "$PAR2_RS_REPAIR" ]]; then
     # shellcheck disable=SC1090
     source "$HOME/.cargo/env"
   fi
-  (cd "$HOME/par2-rs" && cargo build --release --bins)
+  (cd "$PROJECT_ROOT" && cargo build --release --bins)
 fi
 
 if [[ ! -x "$PAR2_RS_CREATE" || ! -x "$PAR2_RS_REPAIR" ]]; then
