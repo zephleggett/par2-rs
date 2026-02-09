@@ -5,7 +5,7 @@
 
 A Rust implementation of PAR2 (Parchive 2.0) for file verification and repair using Reed-Solomon error correction over GF(2^16).
 
-> **Alpha software.** Tested on Apple Silicon and x86 GitHub CI. Platform compatibility with diverse file types has not been extensively verified. Keep backups of important data.
+> Tested on Apple Silicon and x86 GitHub CI. Keep backups of important data.
 
 ## Building
 
@@ -151,7 +151,6 @@ See [tests/README.md](tests/README.md) for details.
 Contributions welcome. Areas that could use work:
 
 - **x86 benchmarking** - SIMD paths need performance testing on real Intel/AMD hardware
-- **CLI improvements** - Better progress reporting and error messages
 - **Unicode filenames** - Currently ASCII only
 
 ## Acknowledgments

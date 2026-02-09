@@ -12,6 +12,7 @@
 | edge_cases.rs | Boundary conditions |
 | error_paths.rs | Error handling |
 | progress.rs | Progress callbacks |
+| robustness.rs | Large files, many files, production edge cases |
 
 Utilities in `common/mod.rs`.
 
