@@ -39,6 +39,7 @@ fn test_comprehensive_workflow() {
     let creator = Par2Creator::new(vec![file1.clone(), file2.clone()])
         .unwrap()
         .with_redundancy(60.0)
+        .unwrap()
         .with_volume_scheme(VolumeScheme::Exponential)
         .with_output_path(base.join("test.par2"));
 
@@ -139,6 +140,7 @@ fn test_block_level_repair() {
     let creator = Par2Creator::new(vec![test_file.clone()])
         .unwrap()
         .with_redundancy(15.0)
+        .unwrap()
         .with_output_path(base.join("test.par2"));
 
     let par2_files = creator.create().unwrap();
@@ -206,6 +208,7 @@ fn test_multiple_files_workflow() {
     let creator = Par2Creator::new(files.clone())
         .unwrap()
         .with_redundancy(25.0)
+        .unwrap()
         .with_volume_scheme(VolumeScheme::Exponential)
         .with_output_path(base.join("archive.par2"));
 

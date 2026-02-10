@@ -31,6 +31,7 @@ fn test_large_single_file_10mb() {
     let creator = Par2Creator::new(vec![file.clone()])
         .unwrap()
         .with_redundancy(10.0)
+        .unwrap()
         .with_output_path(temp.path().join("large.par2"));
     let par2_files = creator.create().unwrap();
 
@@ -64,7 +65,8 @@ fn test_large_file_full_reconstruction() {
 
     let creator = Par2Creator::new(vec![file.clone()])
         .unwrap()
-        .with_redundancy(100.0) // 100% redundancy to cover full file loss
+        .with_redundancy(100.0)
+        .unwrap() // 100% redundancy to cover full file loss
         .with_output_path(temp.path().join("data.par2"));
     let par2_files = creator.create().unwrap();
 
@@ -109,6 +111,7 @@ fn test_many_small_files_50() {
     let creator = Par2Creator::new(files.clone())
         .unwrap()
         .with_redundancy(20.0)
+        .unwrap()
         .with_volume_scheme(VolumeScheme::Exponential)
         .with_output_path(temp.path().join("archive.par2"));
     let par2_files = creator.create().unwrap();
@@ -165,6 +168,7 @@ fn test_mixed_file_sizes() {
     let creator = Par2Creator::new(files.clone())
         .unwrap()
         .with_redundancy(30.0)
+        .unwrap()
         .with_output_path(temp.path().join("mixed.par2"));
     let par2_files = creator.create().unwrap();
 
@@ -202,7 +206,8 @@ fn test_progress_never_exceeds_total() {
 
     let creator = Par2Creator::new(vec![file.clone()])
         .unwrap()
-        .with_redundancy(20.0);
+        .with_redundancy(20.0)
+        .unwrap();
     let par2_files = creator.create().unwrap();
 
     // Corrupt the file
@@ -265,7 +270,8 @@ fn test_progress_monotonic_per_operation() {
 
     let creator = Par2Creator::new(vec![file1.clone(), file2.clone()])
         .unwrap()
-        .with_redundancy(20.0);
+        .with_redundancy(20.0)
+        .unwrap();
     let par2_files = creator.create().unwrap();
 
     corrupt_file(&file1, 1000, &[0xFF; 5000]).unwrap();
@@ -332,6 +338,7 @@ fn test_creator_progress_callbacks() {
     let creator = Par2Creator::new(vec![file])
         .unwrap()
         .with_redundancy(10.0)
+        .unwrap()
         .with_progress_callback(Arc::new(progress_cb));
     creator.create().unwrap();
 
@@ -371,7 +378,8 @@ fn test_repair_includes_post_verification() {
 
     let creator = Par2Creator::new(vec![file.clone()])
         .unwrap()
-        .with_redundancy(20.0);
+        .with_redundancy(20.0)
+        .unwrap();
     let par2_files = creator.create().unwrap();
 
     // Corrupt the file
@@ -418,7 +426,8 @@ fn test_purge_after_successful_repair() {
 
     let creator = Par2Creator::new(vec![file.clone()])
         .unwrap()
-        .with_redundancy(20.0);
+        .with_redundancy(20.0)
+        .unwrap();
     let par2_files = creator.create().unwrap();
 
     // Corrupt the file
@@ -453,7 +462,8 @@ fn test_message_callbacks_during_repair() {
 
     let creator = Par2Creator::new(vec![file.clone()])
         .unwrap()
-        .with_redundancy(20.0);
+        .with_redundancy(20.0)
+        .unwrap();
     let par2_files = creator.create().unwrap();
 
     // Corrupt the file
@@ -495,7 +505,8 @@ fn test_message_callbacks_missing_file() {
 
     let creator = Par2Creator::new(vec![file.clone()])
         .unwrap()
-        .with_redundancy(100.0);
+        .with_redundancy(100.0)
+        .unwrap();
     let par2_files = creator.create().unwrap();
 
     // Delete the file
@@ -540,6 +551,7 @@ fn test_exponential_volumes_many_blocks() {
     let creator = Par2Creator::new(vec![file.clone()])
         .unwrap()
         .with_redundancy(50.0)
+        .unwrap()
         .with_volume_scheme(VolumeScheme::Exponential)
         .with_output_path(temp.path().join("volumes.par2"));
     let par2_files = creator.create().unwrap();
@@ -586,6 +598,7 @@ fn test_parallel_verification_progress() {
     let creator = Par2Creator::new(files.clone())
         .unwrap()
         .with_redundancy(10.0)
+        .unwrap()
         .with_output_path(temp.path().join("parallel.par2"));
     let par2_files = creator.create().unwrap();
 

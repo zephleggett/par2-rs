@@ -20,6 +20,7 @@ fn test_create_and_verify_single_file() {
     let creator = Par2Creator::new(vec![test_file.clone()])
         .unwrap()
         .with_redundancy(10.0)
+        .unwrap()
         .with_output_path(temp_dir.path().join("test.par2"));
 
     let par2_files = creator.create().unwrap();
@@ -59,6 +60,7 @@ fn test_create_and_verify_multiple_files() {
     let creator = Par2Creator::new(test_files.clone())
         .unwrap()
         .with_redundancy(5.0)
+        .unwrap()
         .with_output_path(temp_dir.path().join("archive.par2"));
 
     let par2_files = creator.create().unwrap();
@@ -98,6 +100,7 @@ fn test_create_with_exponential_volumes() {
     let creator = Par2Creator::new(vec![test_file])
         .unwrap()
         .with_redundancy(20.0)
+        .unwrap()
         .with_volume_scheme(VolumeScheme::Exponential)
         .with_output_path(temp_dir.path().join("large.par2"));
 
@@ -119,6 +122,7 @@ fn test_create_and_repair_deleted_file() {
     let creator = Par2Creator::new(vec![file1.clone(), file2.clone()])
         .unwrap()
         .with_redundancy(50.0)
+        .unwrap()
         .with_output_path(temp_dir.path().join("archive.par2"));
 
     let par2_files = creator.create().unwrap();

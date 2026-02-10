@@ -211,9 +211,23 @@ impl Par2Creator {
     }
 
     /// Set redundancy percentage (default: 5.0)
-    pub fn with_redundancy(mut self, percent: f32) -> Self {
+    ///
+    /// Must be a finite, non-negative value (e.g., 0.0 for verification-only,
+    /// 5.0 for 5% redundancy, 100.0 for full redundancy).
+    pub fn with_redundancy(mut self, percent: f32) -> Result<Self> {
+        if percent.is_nan() || percent.is_infinite() {
+            return Err(Par2Error::InvalidFormat(
+                "Redundancy percentage must be a finite number".to_string(),
+            ));
+        }
+        if percent < 0.0 {
+            return Err(Par2Error::InvalidFormat(format!(
+                "Redundancy percentage cannot be negative (got {})",
+                percent
+            )));
+        }
         self.redundancy_percent = percent;
-        self
+        Ok(self)
     }
 
     /// Set output path (default: first_file.par2)
@@ -424,7 +438,14 @@ impl Par2Creator {
         let file_ids: Vec<FileHash> = file_infos.iter().map(|f| f.file_id).collect();
         let mut main_body = Vec::new();
         main_body.extend_from_slice(&block_size.to_le_bytes());
-        main_body.extend_from_slice(&(file_infos.len() as u32).to_le_bytes());
+        let file_count = u32::try_from(file_infos.len()).map_err(|_| {
+            Par2Error::InvalidFormat(format!(
+                "Too many files ({}) for PAR2 format (max {})",
+                file_infos.len(),
+                u32::MAX
+            ))
+        })?;
+        main_body.extend_from_slice(&file_count.to_le_bytes());
 
         let mut sorted_ids = file_ids.clone();
         sorted_ids.sort_unstable();

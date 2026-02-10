@@ -106,7 +106,13 @@ fn main() {
     };
 
     if let Some(r) = redundancy {
-        creator = creator.with_redundancy(r);
+        creator = match creator.with_redundancy(r) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("Error: {}", e);
+                process::exit(1);
+            }
+        };
     }
 
     if let Some(path) = output_path {

@@ -41,7 +41,8 @@ fn test_repair_single_deleted_file() -> Result<()> {
 
     // Create PAR2 with enough redundancy to recover one file
     let creator = Par2Creator::new(vec![file1.clone(), file2.clone()])?
-        .with_redundancy(60.0) // 50% of total data
+        .with_redundancy(60.0)
+        .unwrap() // 50% of total data
         .with_output_path(base.join("test.par2"));
     let par2_files = creator.create()?;
 
@@ -86,6 +87,7 @@ fn test_repair_single_damaged_file() -> Result<()> {
     // Create PAR2 with 20% redundancy
     let creator = Par2Creator::new(vec![test_file.clone()])?
         .with_redundancy(20.0)
+        .unwrap()
         .with_output_path(base.join("test.par2"));
     let par2_files = creator.create()?;
 
@@ -125,6 +127,7 @@ fn test_repair_missing_file() -> Result<()> {
     // Create PAR2 with 100% redundancy (can recover entire file)
     let creator = Par2Creator::new(vec![file1.clone()])?
         .with_redundancy(100.0)
+        .unwrap()
         .with_output_path(base.join("data.par2"));
     let par2_files = creator.create()?;
 
@@ -164,6 +167,7 @@ fn test_repair_multiple_damaged_files() -> Result<()> {
     // Create PAR2 with 40% redundancy
     let creator = Par2Creator::new(files.clone())?
         .with_redundancy(40.0)
+        .unwrap()
         .with_output_path(base.join("archive.par2"));
     let par2_files = creator.create()?;
 
@@ -203,6 +207,7 @@ fn test_insufficient_recovery_blocks() -> Result<()> {
     // Create PAR2 with only 10% redundancy
     let creator = Par2Creator::new(vec![test_file.clone()])?
         .with_redundancy(10.0)
+        .unwrap()
         .with_output_path(base.join("test.par2"));
     let par2_files = creator.create()?;
 
@@ -285,6 +290,7 @@ fn test_exponential_volume_scheme() -> Result<()> {
 
     let creator = Par2Creator::new(vec![test_file])?
         .with_redundancy(30.0)
+        .unwrap()
         .with_volume_scheme(VolumeScheme::Exponential)
         .with_output_path(base.join("test.par2"));
 

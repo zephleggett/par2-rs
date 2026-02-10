@@ -24,6 +24,7 @@ fn test_verification_read_errors() {
     let creator = Par2Creator::new(vec![test_file.clone()])
         .unwrap()
         .with_redundancy(15.0)
+        .unwrap()
         .with_output_path(base.join("test.par2"));
 
     let par2_files = creator.create().unwrap();
@@ -60,6 +61,7 @@ fn test_block_level_damage_detection() {
     let creator = Par2Creator::new(vec![test_file.clone()])
         .unwrap()
         .with_redundancy(25.0)
+        .unwrap()
         .with_output_path(base.join("test.par2"));
 
     let par2_files = creator.create().unwrap();
@@ -92,6 +94,7 @@ fn test_rename_collision() {
     let creator = Par2Creator::new(vec![original.clone()])
         .unwrap()
         .with_redundancy(15.0)
+        .unwrap()
         .with_output_path(base.join("test.par2"));
 
     let par2_files = creator.create().unwrap();
@@ -130,6 +133,7 @@ fn test_damaged_file_exponential_volumes() {
     let creator = Par2Creator::new(vec![file1.clone()])
         .unwrap()
         .with_redundancy(30.0)
+        .unwrap()
         .with_volume_scheme(VolumeScheme::Exponential)
         .with_output_path(base.join("test.par2"));
 
@@ -161,6 +165,7 @@ fn test_verification_16k_hash_optimization() {
     let creator = Par2Creator::new(vec![test_file.clone()])
         .unwrap()
         .with_redundancy(20.0)
+        .unwrap()
         .with_output_path(base.join("test.par2"));
     let par2_files = creator.create().unwrap();
 
@@ -185,6 +190,7 @@ fn test_verification_small_file_skips_16k() {
     let creator = Par2Creator::new(vec![test_file.clone()])
         .unwrap()
         .with_redundancy(20.0)
+        .unwrap()
         .with_output_path(base.join("test.par2"));
     let par2_files = creator.create().unwrap();
 
@@ -208,6 +214,7 @@ fn test_verification_16k_hash_mismatch() {
     let creator = Par2Creator::new(vec![test_file.clone()])
         .unwrap()
         .with_redundancy(30.0)
+        .unwrap()
         .with_output_path(base.join("test.par2"));
     let par2_files = creator.create().unwrap();
 
@@ -240,6 +247,7 @@ fn test_verification_file_size_mismatch() {
     let creator = Par2Creator::new(vec![test_file.clone()])
         .unwrap()
         .with_redundancy(20.0)
+        .unwrap()
         .with_output_path(base.join("test.par2"));
     let par2_files = creator.create().unwrap();
 
@@ -277,7 +285,8 @@ fn test_missing_file_recreation_with_volumes() {
     // 4/7 = 57.14% redundancy - use slightly less to ensure exactly 4 blocks
     let creator = Par2Creator::new(vec![file1.clone(), file2.clone()])
         .unwrap()
-        .with_redundancy(57.0) // Exactly 4 recovery blocks (57% of 7 = 3.99 → 4)
+        .with_redundancy(57.0)
+        .unwrap() // Exactly 4 recovery blocks (57% of 7 = 3.99 → 4)
         .with_volume_scheme(VolumeScheme::Exponential)
         .with_output_path(base.join("test.par2"));
     let par2_files = creator.create().unwrap();
@@ -352,6 +361,7 @@ fn test_verification_with_ifsc() {
     let creator = Par2Creator::new(vec![test_file.clone()])
         .unwrap()
         .with_redundancy(20.0)
+        .unwrap()
         .with_output_path(base.join("test.par2"));
     let par2_files = creator.create().unwrap();
 
@@ -409,6 +419,7 @@ fn test_multiple_blocks_damaged() {
         .with_block_size(2048)
         .unwrap()
         .with_redundancy(50.0)
+        .unwrap()
         .with_output_path(base.join("test.par2"));
     let par2_files = creator.create().unwrap();
 

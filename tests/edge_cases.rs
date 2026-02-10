@@ -162,7 +162,7 @@ fn test_zero_redundancy() {
     create_pattern_file(&file, b"DATA", 5000).unwrap();
 
     let creator = Par2Creator::new(vec![file.clone()]).unwrap();
-    let par2_files = creator.with_redundancy(0.0).create().unwrap();
+    let par2_files = creator.with_redundancy(0.0).unwrap().create().unwrap();
 
     // Should create PAR2 with zero redundancy
     assert!(!par2_files.is_empty());
@@ -189,7 +189,8 @@ fn test_insufficient_redundancy() {
     // Create with only 5% redundancy
     let creator = Par2Creator::new(vec![file.clone()])
         .unwrap()
-        .with_redundancy(5.0);
+        .with_redundancy(5.0)
+        .unwrap();
     let par2_files = creator.create().unwrap();
 
     // Damage 50% of file (way more than 5% redundancy)

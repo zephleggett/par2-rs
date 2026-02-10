@@ -16,7 +16,8 @@ fn test_progress_callbacks_during_repair() {
     // Create PAR2 with 20% redundancy
     let creator = Par2Creator::new(vec![file.clone()])
         .unwrap()
-        .with_redundancy(20.0);
+        .with_redundancy(20.0)
+        .unwrap();
     let par2_files = creator.create().unwrap();
 
     // Damage the file

@@ -88,7 +88,8 @@ fn test_multiple_damaged_files() {
     // Create with very high redundancy to handle complete file replacements
     let creator = Par2Creator::new(vec![file1.clone(), file2.clone(), file3.clone()])
         .unwrap()
-        .with_redundancy(100.0); // 100% redundancy to recover completely destroyed files
+        .with_redundancy(100.0)
+        .unwrap(); // 100% redundancy to recover completely destroyed files
     let par2_files = creator.create().unwrap();
 
     // Damage all three files completely (smaller than originals)
@@ -127,7 +128,8 @@ fn test_repair_without_enough_recovery_blocks() {
     // Create with minimal redundancy (5%)
     let creator = Par2Creator::new(vec![file.clone()])
         .unwrap()
-        .with_redundancy(5.0);
+        .with_redundancy(5.0)
+        .unwrap();
     let par2_files = creator.create().unwrap();
 
     // Damage 50% of file (way more than 5% redundancy)
