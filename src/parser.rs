@@ -213,11 +213,11 @@ impl Par2File {
 
             // Update progress
             if let Some(ref cb) = progress_callback {
-                let progress = if file_size > 0 {
-                    (position * 100 / file_size).min(100)
-                } else {
-                    100
-                };
+                // `checked_div` keeps clippy::manual_checked_ops happy and is
+                // zero-safe (empty file -> report 100%).
+                let progress = (position * 100)
+                    .checked_div(file_size)
+                    .map_or(100, |p| p.min(100));
                 cb(super::Par2Operation::Loading, progress, 100);
             }
 
