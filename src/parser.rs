@@ -197,6 +197,10 @@ impl Par2File {
         let mut files_in_order = Vec::new();
         let mut recovery_blocks = Vec::new();
         let mut slice_checksums: HashMap<FileHash, Vec<SliceChecksum>> = HashMap::new();
+        // The Main packet lists the recovery-set File IDs in the canonical order
+        // that defines global input-block numbering. We capture it here so the
+        // input block index -> Reed-Solomon constant mapping is authoritative.
+        let mut main_file_id_order: Vec<FileHash> = Vec::new();
 
         let mut position = 0u64;
         // Track recovery slice positions found before the Main packet
@@ -334,6 +338,13 @@ impl Par2File {
                     if let Some(partial) = parse_main_packet_from_header(&header) {
                         if let Some(main_packet) = complete_main_packet(partial, &packet_body) {
                             block_size = main_packet.block_size;
+                            // Capture the recovery-set File ID order (authoritative
+                            // input-block ordering) the first time we see a Main packet.
+                            if main_file_id_order.is_empty()
+                                && !main_packet.recovery_file_ids.is_empty()
+                            {
+                                main_file_id_order = main_packet.recovery_file_ids;
+                            }
                         }
                     }
                 }
@@ -501,6 +512,24 @@ impl Par2File {
             cb(super::Par2Operation::Loading, 100, 100);
         }
 
+        // Establish the canonical input-block ordering of the recovery-set files.
+        //
+        // The global input block index -> Reed-Solomon constant mapping depends
+        // entirely on this order. Getting it wrong silently breaks any repair that
+        // needs a recovery block with exponent >= 1 (exponent 0 is plain XOR parity
+        // and is immune), which is exactly why single-block repairs could succeed
+        // while multi-block repairs of real par2cmdline sets produced corrupt output.
+        //
+        // The authoritative source is the Main packet's recovery-set File ID list,
+        // which par2cmdline emits in its canonical order. File Description packets
+        // can appear in any order in the stream, so we cannot rely on stream order.
+        //
+        // When the Main list is available we follow it exactly. Otherwise we fall
+        // back to par2cmdline's File ID comparison, which orders the 16-byte ID as
+        // a LITTLE-ENDIAN value (i.e. compare byte 15 first, down to byte 0) -- NOT
+        // a plain big-endian/lexicographic byte compare.
+        reorder_files_canonically(&mut files_in_order, &main_file_id_order);
+
         Ok(Self {
             block_size,
             files,
@@ -511,9 +540,60 @@ impl Par2File {
     }
 }
 
+/// Compare two PAR2 File IDs using par2cmdline's ordering.
+///
+/// par2cmdline treats the 16-byte File ID (an MD5 hash) as a little-endian
+/// 128-bit number for ordering: it compares the highest-index byte first and the
+/// lowest-index byte last. This is the order in which input blocks are numbered,
+/// so it must match exactly or recovery exponents >= 1 will be misapplied.
+pub(crate) fn cmp_file_id_par2(a: &FileHash, b: &FileHash) -> std::cmp::Ordering {
+    for i in (0..16).rev() {
+        match a[i].cmp(&b[i]) {
+            std::cmp::Ordering::Equal => continue,
+            ord => return ord,
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
+/// Reorder `files` into the canonical PAR2 input-block ordering.
+///
+/// If `main_order` (the recovery-set File ID list from the Main packet) is
+/// available, files are placed in exactly that order; any files not listed there
+/// (defensive: shouldn't happen for a valid set) are appended afterwards using
+/// the par2cmdline File ID comparison so the result is still deterministic.
+///
+/// If `main_order` is empty, the entire list is sorted with the par2cmdline File
+/// ID comparison, which produces the same ordering par2cmdline would have written.
+fn reorder_files_canonically(files: &mut [FileInfo], main_order: &[FileHash]) {
+    if main_order.is_empty() {
+        files.sort_by(|a, b| cmp_file_id_par2(&a.file_id, &b.file_id));
+        return;
+    }
+
+    let rank: HashMap<FileHash, usize> = main_order
+        .iter()
+        .enumerate()
+        .map(|(i, id)| (*id, i))
+        .collect();
+
+    // Stable sort: primary key is the Main-packet rank (unlisted files sort last
+    // via usize::MAX), secondary key is the par2cmdline File ID comparison so any
+    // unlisted leftovers remain deterministic.
+    files.sort_by(|a, b| {
+        let ra = rank.get(&a.file_id).copied().unwrap_or(usize::MAX);
+        let rb = rank.get(&b.file_id).copied().unwrap_or(usize::MAX);
+        ra.cmp(&rb)
+            .then_with(|| cmp_file_id_par2(&a.file_id, &b.file_id))
+    });
+}
+
 /// Main packet data
 struct MainPacket {
     block_size: u64,
+    /// File IDs of the recovery-set files, in the canonical order that defines
+    /// global input-block numbering (and therefore the RS constant mapping).
+    recovery_file_ids: Vec<FileHash>,
 }
 
 /// Quickly read just the recovery_set_id from a PAR2 file (for volume discovery)
@@ -542,10 +622,20 @@ fn parse_main_packet_from_header(_header: &[u8; 64]) -> Option<MainPacket> {
     // Return a partial result that caller will complete
     Some(MainPacket {
         block_size: 0, // Will be filled from body
+        recovery_file_ids: Vec::new(),
     })
 }
 
 /// Complete main packet parsing from body
+///
+/// Main packet body layout (PAR2 spec):
+/// - offset 0:  u64 LE  slice (block) size
+/// - offset 8:  u32 LE  number of files in the recovery set
+/// - offset 12: [16]u8 × count  File IDs of the recovery-set files, ascending
+/// - then:      [16]u8 × N      File IDs of non-recovery-set files
+///
+/// The recovery-set File ID list defines the canonical input-block ordering, so
+/// we surface it for the caller to reorder file metadata accordingly.
 fn complete_main_packet(mut packet: MainPacket, body: &[u8]) -> Option<MainPacket> {
     if body.len() < 8 {
         return None;
@@ -555,6 +645,25 @@ fn complete_main_packet(mut packet: MainPacket, body: &[u8]) -> Option<MainPacke
     packet.block_size = u64::from_le_bytes([
         body[0], body[1], body[2], body[3], body[4], body[5], body[6], body[7],
     ]);
+
+    // Read recovery-set file count and File IDs (best-effort; older/odd writers
+    // may omit them, in which case we fall back to a derived sort).
+    if body.len() >= 12 {
+        let count = u32::from_le_bytes([body[8], body[9], body[10], body[11]]) as usize;
+        // Cap the pre-allocation so a corrupt count can't request a huge Vec.
+        let mut ids = Vec::with_capacity(count.min(65_535));
+        let mut off = 12usize;
+        for _ in 0..count {
+            if off + 16 > body.len() {
+                break;
+            }
+            let mut id = [0u8; 16];
+            id.copy_from_slice(&body[off..off + 16]);
+            ids.push(id);
+            off += 16;
+        }
+        packet.recovery_file_ids = ids;
+    }
 
     Some(packet)
 }
@@ -765,4 +874,111 @@ fn parse_volume_file(
     }
 
     Ok(recovery_blocks)
+}
+
+#[cfg(test)]
+mod ordering_tests {
+    use super::*;
+    use crate::galois::{gf_mul, gf_pow};
+
+    #[test]
+    fn cmp_file_id_is_little_endian() {
+        // Two IDs differing only in the highest-index byte: that byte dominates,
+        // proving the comparison is little-endian (byte 15 first), not lexicographic.
+        let mut a = [0u8; 16];
+        let mut b = [0u8; 16];
+        a[0] = 0xFF; // low byte
+        b[15] = 0x01; // high byte
+                      // Lexicographic (big-endian) would say a > b (0xFF at index 0). The
+                      // par2cmdline little-endian compare must say a < b.
+        assert_eq!(cmp_file_id_par2(&a, &b), std::cmp::Ordering::Less);
+    }
+
+    #[test]
+    fn main_packet_order_is_used() {
+        // Files arrive in stream order; reorder must follow the Main packet list.
+        let mk = |byte: u8, name: &str| FileInfo {
+            file_id: [byte; 16],
+            hash: [0u8; 16],
+            hash_16k: [0u8; 16],
+            length: 1,
+            name: name.to_string(),
+        };
+        let mut files = vec![mk(3, "c"), mk(1, "a"), mk(2, "b")];
+        let main_order = vec![[2u8; 16], [3u8; 16], [1u8; 16]];
+        reorder_files_canonically(&mut files, &main_order);
+        let names: Vec<&str> = files.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, vec!["b", "c", "a"], "must follow Main packet order");
+    }
+
+    /// End-to-end invariant on the bundled real fixtures: after loading, each
+    /// recovery block must equal Sigma base_i^exp * D_i over the pristine data
+    /// blocks, in the canonical ordering. This is the property the FileID-ordering
+    /// bug violated for exponent >= 1.
+    #[test]
+    fn recovery_blocks_match_recomputed_parity() {
+        let idx = Path::new("tests/data/testdata.par2");
+        if !idx.exists() {
+            eprintln!("bundled fixtures missing; skipping");
+            return;
+        }
+        crate::galois::init_tables();
+        let par2 = Par2File::load(idx, Path::new("tests/data"), None).unwrap();
+        let bs = par2.block_size as usize;
+        let symbols = bs / 2;
+
+        // Reconstruct the global data-block stream in canonical order.
+        let mut blocks: Vec<Vec<u8>> = Vec::new();
+        for fi in &par2.files_in_order {
+            let nblocks = fi.length.div_ceil(par2.block_size) as usize;
+            let raw = std::fs::read(Path::new("tests/data").join(&fi.name)).unwrap();
+            for b in 0..nblocks {
+                let start = b * bs;
+                let end = (start + bs).min(raw.len());
+                let mut data = vec![0u8; bs];
+                if start < raw.len() {
+                    data[..end - start].copy_from_slice(&raw[start..end]);
+                }
+                blocks.push(data);
+            }
+        }
+
+        // PAR2 base constants for `blocks.len()` input blocks.
+        let mut constants = Vec::with_capacity(blocks.len());
+        let mut n: u32 = 1;
+        while constants.len() < blocks.len() {
+            if n % 3 != 0 && n % 5 != 0 && n % 17 != 0 && n % 257 != 0 {
+                constants.push(gf_pow(2, n as usize));
+            }
+            n += 1;
+        }
+
+        // Check several exponents, including >= 1 which the bug corrupted.
+        for exp in [0u32, 1, 2, 3, 5] {
+            let mut acc = vec![0u16; symbols];
+            for (gidx, data) in blocks.iter().enumerate() {
+                let coeff = gf_pow(constants[gidx], exp as usize);
+                for s in 0..symbols {
+                    let d = u16::from_le_bytes([data[s * 2], data[s * 2 + 1]]);
+                    acc[s] ^= gf_mul(d, coeff);
+                }
+            }
+            let mut expected = vec![0u8; bs];
+            for s in 0..symbols {
+                let b = acc[s].to_le_bytes();
+                expected[s * 2] = b[0];
+                expected[s * 2 + 1] = b[1];
+            }
+            let rb = par2
+                .recovery_blocks
+                .iter()
+                .find(|r| r.exponent == exp)
+                .unwrap_or_else(|| panic!("no recovery block with exponent {exp}"));
+            let got = rb.read_all().unwrap();
+            assert_eq!(
+                got, expected,
+                "recovery block exp={exp} must equal recomputed Sigma base_i^exp * D_i"
+            );
+        }
+    }
 }

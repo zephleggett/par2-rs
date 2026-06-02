@@ -52,6 +52,7 @@
 mod creator;
 pub mod galois;
 pub mod hash;
+mod info;
 mod par2_rs;
 mod parser;
 mod repair;
@@ -63,9 +64,11 @@ pub mod error;
 
 pub use creator::Par2Creator;
 pub use error::{Par2Error, Result};
+pub use info::{Par2FileEntry, Par2Info};
 pub use volumes::VolumeScheme;
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 /// PAR2 operation type for progress tracking
@@ -153,7 +156,65 @@ impl Par2Repairer {
         progress_callback: Option<ProgressCallback>,
         message_callback: Option<MessageCallback>,
     ) -> Result<()> {
+        self.repair_with_callbacks_cancellable(
+            do_repair,
+            purge_files,
+            progress_callback,
+            message_callback,
+            None,
+        )
+    }
+
+    /// Perform PAR2 verification and optional repair, cancellable via a shared flag.
+    ///
+    /// This is identical to [`Par2Repairer::repair_with_callbacks`] but accepts a
+    /// `cancel` flag. Setting the flag to `true` from any thread requests early
+    /// termination and the call returns [`Par2Error::Cancelled`].
+    ///
+    /// # Cancellation safety
+    ///
+    /// Cancellation is checked at safe points throughout loading, verification,
+    /// and repair. Crucially, repair never mutates the protected output files in
+    /// place: reconstructed data is written to sibling `<final>.par2tmp` files and
+    /// only atomically renamed into place once the full reconstruction succeeds.
+    /// Therefore a cancellation (or any error) during repair leaves every original
+    /// data file byte-identical to before the call. A cancellation requested AFTER
+    /// a successful repair simply skips PAR2 purge and returns `Cancelled` (the
+    /// repaired data has already been committed).
+    ///
+    /// # Arguments
+    /// * `do_repair` - If true, perform repair; if false, only verify
+    /// * `purge_files` - If true, delete PAR2 files after successful repair
+    /// * `progress_callback` - Optional callback for progress updates
+    /// * `message_callback` - Optional callback for user-visible messages
+    /// * `cancel` - Optional shared flag; setting it to `true` requests cancellation
+    ///
+    /// # Returns
+    /// * `Ok(())` - Files were correct or successfully repaired
+    /// * `Err(Par2Error::Cancelled)` - The operation was cancelled
+    /// * `Err(Par2Error)` - Verification/repair failed
+    pub fn repair_with_callbacks_cancellable(
+        &self,
+        do_repair: bool,
+        purge_files: bool,
+        progress_callback: Option<ProgressCallback>,
+        message_callback: Option<MessageCallback>,
+        cancel: Option<Arc<AtomicBool>>,
+    ) -> Result<()> {
         use std::time::Instant;
+
+        let cancel_ref = cancel.as_deref();
+
+        // Helper closure to test cancellation at coarse boundaries.
+        let cancelled = || {
+            cancel_ref
+                .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+                .unwrap_or(false)
+        };
+
+        if cancelled() {
+            return Err(Par2Error::Cancelled);
+        }
 
         // Step 1: Load and parse PAR2 file
         if let Some(ref cb) = progress_callback {
@@ -183,6 +244,10 @@ impl Par2Repairer {
             "File scan completed"
         );
 
+        if cancelled() {
+            return Err(Par2Error::Cancelled);
+        }
+
         // Step 3: Verify files
         if let Some(ref cb) = progress_callback {
             cb(Par2Operation::Verifying, 0, 100);
@@ -195,6 +260,7 @@ impl Par2Repairer {
             &self.base_path,
             progress_callback.clone(),
             message_callback.clone(),
+            cancel_ref,
         )?;
         tracing::debug!(
             elapsed_secs = verify_start.elapsed().as_secs_f64(),
@@ -204,6 +270,10 @@ impl Par2Repairer {
         // Step 4: Repair if needed and requested
         let repair_succeeded;
         if !verification_result.all_verified && do_repair {
+            if cancelled() {
+                return Err(Par2Error::Cancelled);
+            }
+
             if let Some(ref cb) = progress_callback {
                 cb(Par2Operation::Repairing, 0, 100);
             }
@@ -215,11 +285,19 @@ impl Par2Repairer {
                 &self.base_path,
                 progress_callback.clone(),
                 message_callback.clone(),
+                cancel_ref,
             )?;
             tracing::debug!(
                 elapsed_secs = repair_start.elapsed().as_secs_f64(),
                 "Repair completed"
             );
+
+            // A cancellation requested AFTER a successful repair is safe: the
+            // repaired data has already been committed (temp files renamed in).
+            // We simply skip the post-repair re-verify and purge.
+            if cancelled() {
+                return Err(Par2Error::Cancelled);
+            }
 
             // Step 4b: Verify repaired files to confirm repair success
             if let Some(ref msg_cb) = message_callback {
@@ -232,6 +310,7 @@ impl Par2Repairer {
                 &self.base_path,
                 None, // Don't report progress for post-repair verify (it's fast)
                 message_callback.clone(),
+                cancel_ref,
             )?;
             tracing::debug!(
                 elapsed_secs = verify_start2.elapsed().as_secs_f64(),
@@ -255,6 +334,12 @@ impl Par2Repairer {
             ));
         } else {
             repair_succeeded = false;
+        }
+
+        // A cancellation requested before purge skips purge and returns Cancelled.
+        // This is safe: verification/repair already completed and committed.
+        if cancelled() {
+            return Err(Par2Error::Cancelled);
         }
 
         // Step 5: Purge PAR2 files if requested (after verification OR successful repair)

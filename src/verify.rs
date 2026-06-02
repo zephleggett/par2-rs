@@ -33,9 +33,19 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, Mutex,
 };
+
+/// Approximate byte interval between cancellation checks inside large per-file
+/// loops, so that aborting a single huge file is reasonably prompt.
+const CANCEL_CHECK_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Returns `true` if a cancellation flag is set.
+#[inline]
+fn is_cancelled(cancel: Option<&AtomicBool>) -> bool {
+    cancel.map(|c| c.load(Ordering::Relaxed)).unwrap_or(false)
+}
 
 /// Block-level damage information for a file
 #[derive(Debug, Clone)]
@@ -62,17 +72,30 @@ pub fn verify_files(
     base_path: &Path,
     progress_callback: Option<ProgressCallback>,
 ) -> Result<VerificationResult> {
-    verify_files_with_messages(par2_data, extra_files, base_path, progress_callback, None)
+    verify_files_with_messages(
+        par2_data,
+        extra_files,
+        base_path,
+        progress_callback,
+        None,
+        None,
+    )
 }
 
 /// Verify files against PAR2 data with message callback
+#[allow(clippy::too_many_arguments)]
 pub fn verify_files_with_messages(
     par2_data: &Par2File,
     extra_files: &[PathBuf],
     base_path: &Path,
     progress_callback: Option<ProgressCallback>,
     message_callback: Option<MessageCallback>,
+    cancel: Option<&AtomicBool>,
 ) -> Result<VerificationResult> {
+    // Shared flag set whenever a parallel closure observes cancellation.
+    // Because rayon's `par_iter().for_each(...)` swallows inner Results, we use
+    // this to detect cancellation after each parallel phase and return early.
+    let observed_cancel = Arc::new(AtomicBool::new(false));
     // Calculate total bytes for byte-level progress
     let total_bytes: u64 = par2_data.files.values().map(|f| f.length).sum();
     let bytes_verified = Arc::new(AtomicU64::new(0));
@@ -95,6 +118,12 @@ pub fn verify_files_with_messages(
     let files_vec: Vec<_> = par2_data.files.iter().collect();
 
     files_vec.par_iter().for_each(|(file_id, file_info)| {
+        // Skip work entirely if cancellation has been requested.
+        if is_cancelled(cancel) {
+            observed_cancel.store(true, Ordering::Relaxed);
+            return;
+        }
+
         let expected_path = base_path.join(&file_info.name);
 
         if expected_path.exists() {
@@ -120,6 +149,7 @@ pub fn verify_files_with_messages(
                 slice_checksums,
                 par2_data.block_size,
                 Some(&intra_progress),
+                cancel,
             ) {
                 Ok(true) => {
                     tracing::debug!(
@@ -174,6 +204,10 @@ pub fn verify_files_with_messages(
                         files.push(**file_id);
                     }
                 }
+                Err(Par2Error::Cancelled) => {
+                    // Record cancellation so the post-for_each check returns Cancelled.
+                    observed_cancel.store(true, Ordering::Relaxed);
+                }
                 Err(_) => {
                     tracing::debug!(
                         path = %expected_path.display(),
@@ -189,6 +223,11 @@ pub fn verify_files_with_messages(
             }
         }
     });
+
+    // The for_each above swallows inner Results, so check the shared flag now.
+    if observed_cancel.load(Ordering::Relaxed) || is_cancelled(cancel) {
+        return Err(Par2Error::Cancelled);
+    }
 
     // Convert Arc<Mutex<T>> back to owned values
     let mut verified_files = Arc::try_unwrap(verified_files)
@@ -235,6 +274,12 @@ pub fn verify_files_with_messages(
         let matches: Vec<_> = extra_files_filtered
             .par_iter()
             .filter_map(|(extra_path, extra_size)| {
+                // Skip work entirely if cancellation has been requested.
+                if is_cancelled(cancel) {
+                    observed_cancel.store(true, Ordering::Relaxed);
+                    return None;
+                }
+
                 // Quick filter: only check file_ids with matching size
                 let candidate_ids = size_to_file_ids.get(extra_size)?;
 
@@ -258,6 +303,7 @@ pub fn verify_files_with_messages(
                             slice_checksums,
                             par2_data.block_size,
                             Some(&intra_progress),
+                            cancel,
                         ) {
                             return Some((*file_id, extra_path.clone(), file_info.name.clone()));
                         }
@@ -266,6 +312,11 @@ pub fn verify_files_with_messages(
                 None
             })
             .collect();
+
+        // The filter_map above swallows cancellation; check the shared flag now.
+        if observed_cancel.load(Ordering::Relaxed) || is_cancelled(cancel) {
+            return Err(Par2Error::Cancelled);
+        }
 
         // Apply matches (need to dedupe in case multiple files matched same file_id)
         let mut matched_file_ids: std::collections::HashSet<FileHash> =
@@ -338,6 +389,11 @@ pub fn verify_files_with_messages(
         }
     }
 
+    // Check cancellation before block-level damage analysis.
+    if is_cancelled(cancel) {
+        return Err(Par2Error::Cancelled);
+    }
+
     // Fourth pass: For damaged files, perform block-level verification if IFSC data available
     let mut block_damages = HashMap::new();
 
@@ -363,6 +419,7 @@ pub fn verify_files_with_messages(
                         slice_checksums,
                         par2_data.block_size,
                         None,
+                        cancel,
                     ) {
                         Ok(damaged_block_indices) => {
                             let total_blocks = slice_checksums.len();
@@ -400,6 +457,9 @@ pub fn verify_files_with_messages(
                                 // Store the path in verified_files so repair can read good blocks
                                 verified_files.insert(*file_id, path);
                             }
+                        }
+                        Err(Par2Error::Cancelled) => {
+                            return Err(Par2Error::Cancelled);
                         }
                         Err(e) => {
                             tracing::warn!(file = %file_info.name, error = %e, "Block verification failed");
@@ -453,6 +513,31 @@ pub fn verify_files_with_messages(
     })
 }
 
+/// Verify a single reconstructed file on disk against its PAR2 metadata.
+///
+/// Used by repair to validate freshly-reconstructed TEMP files *before* they are
+/// atomically renamed over the user's originals, so an incorrect reconstruction
+/// can never clobber good (or even merely-damaged) data.
+///
+/// Verification prefers IFSC block-level checksums (fast, precise) and falls back
+/// to the full-file MD5 when no slice checksums are available. Returns `Ok(true)`
+/// only if the file's size and all checksums match.
+pub(crate) fn verify_reconstructed_file(
+    path: &Path,
+    file_info: &FileInfo,
+    slice_checksums: Option<&[crate::parser::SliceChecksum]>,
+    block_size: u64,
+) -> Result<bool> {
+    match verify_file_smart(path, file_info, slice_checksums, block_size, None, None) {
+        Ok(ok) => Ok(ok),
+        // A size mismatch means the reconstruction is the wrong length: treat as
+        // a verification failure rather than propagating an error, so the caller
+        // uniformly rejects the temp file and leaves the original untouched.
+        Err(Par2Error::SizeMismatch { .. }) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
 /// Progress callback for intra-file progress reporting
 type ByteProgressCallback<'a> = Option<&'a dyn Fn(u64)>;
 
@@ -466,6 +551,7 @@ fn verify_file_blocks(
     slice_checksums: &[crate::parser::SliceChecksum],
     block_size: u64,
     byte_progress: ByteProgressCallback<'_>,
+    cancel: Option<&AtomicBool>,
 ) -> Result<Vec<usize>> {
     use rayon::prelude::*;
     use std::io::{BufReader, Read, Seek};
@@ -479,9 +565,14 @@ fn verify_file_blocks(
 
     let mut file = BufReader::with_capacity(1024 * 1024, File::open(path)?);
     let mut all_damaged = Vec::new();
+    let mut bytes_since_cancel_check = 0u64;
 
     // Process in batches
     for batch_start in (0..num_blocks).step_by(blocks_per_batch) {
+        // Abort promptly on cancellation, roughly every CANCEL_CHECK_BYTES.
+        if bytes_since_cancel_check >= CANCEL_CHECK_BYTES && is_cancelled(cancel) {
+            return Err(Par2Error::Cancelled);
+        }
         let batch_end = (batch_start + blocks_per_batch).min(num_blocks);
         let batch_size = batch_end - batch_start;
 
@@ -506,6 +597,13 @@ fn verify_file_blocks(
         // Report progress after reading this batch
         if let Some(cb) = byte_progress {
             cb(bytes_read as u64);
+        }
+        bytes_since_cancel_check += bytes_read as u64;
+        if bytes_since_cancel_check >= CANCEL_CHECK_BYTES {
+            bytes_since_cancel_check = 0;
+            if is_cancelled(cancel) {
+                return Err(Par2Error::Cancelled);
+            }
         }
 
         // Verify blocks in this batch in parallel
@@ -567,6 +665,7 @@ fn verify_file_smart(
     slice_checksums: Option<&[crate::parser::SliceChecksum]>,
     block_size: u64,
     byte_progress: ByteProgressCallback<'_>,
+    cancel: Option<&AtomicBool>,
 ) -> Result<bool> {
     let mut file = File::open(path)?;
     let metadata = file.metadata()?;
@@ -591,8 +690,14 @@ fn verify_file_smart(
             "Using IFSC block-level verification (skipping full MD5)"
         );
 
-        let damaged_blocks =
-            verify_file_blocks(path, file_info, checksums, block_size, byte_progress)?;
+        let damaged_blocks = verify_file_blocks(
+            path,
+            file_info,
+            checksums,
+            block_size,
+            byte_progress,
+            cancel,
+        )?;
 
         // If all blocks verified successfully, file is good!
         return Ok(damaged_blocks.is_empty());
@@ -613,6 +718,11 @@ fn verify_file_smart(
         return result;
     }
 
+    // Abort before starting an expensive full-file MD5 pass if cancelled.
+    if is_cancelled(cancel) {
+        return Err(Par2Error::Cancelled);
+    }
+
     // For larger files, first check 16K hash (quick check)
     let hash_16k_matches = verify_16k_hash(&mut file, &file_info.hash_16k)?;
     if let Some(cb) = byte_progress {
@@ -630,7 +740,7 @@ fn verify_file_smart(
     // 16K hash matches, now verify full file hash
     file.seek(SeekFrom::Start(0))?;
 
-    verify_full_hash_with_progress(&mut file, &file_info.hash, byte_progress)
+    verify_full_hash_with_progress(&mut file, &file_info.hash, byte_progress, cancel)
 }
 
 /// Verify first 16KB of file
@@ -651,7 +761,7 @@ fn verify_16k_hash(file: &mut File, expected_hash: &FileHash) -> Result<bool> {
 
 /// Verify full file hash
 fn verify_full_hash(file: &mut File, expected_hash: &FileHash) -> Result<bool> {
-    verify_full_hash_with_progress(file, expected_hash, None)
+    verify_full_hash_with_progress(file, expected_hash, None, None)
 }
 
 /// Verify full file hash with progress reporting
@@ -659,6 +769,7 @@ fn verify_full_hash_with_progress(
     file: &mut File,
     expected_hash: &FileHash,
     byte_progress: ByteProgressCallback<'_>,
+    cancel: Option<&AtomicBool>,
 ) -> Result<bool> {
     use md5::{Digest, Md5};
 
@@ -667,6 +778,7 @@ fn verify_full_hash_with_progress(
     let mut hasher = Md5::new();
     let mut buffer = vec![0u8; 65536]; // 64KB buffer
     let mut bytes_since_report = 0u64;
+    let mut bytes_since_cancel_check = 0u64;
     const REPORT_INTERVAL: u64 = 1024 * 1024; // Report every 1MB
 
     loop {
@@ -683,6 +795,15 @@ fn verify_full_hash_with_progress(
                 cb(bytes_since_report);
             }
             bytes_since_report = 0;
+        }
+
+        // Abort promptly on cancellation, roughly every CANCEL_CHECK_BYTES.
+        bytes_since_cancel_check += bytes_read as u64;
+        if bytes_since_cancel_check >= CANCEL_CHECK_BYTES {
+            bytes_since_cancel_check = 0;
+            if is_cancelled(cancel) {
+                return Err(Par2Error::Cancelled);
+            }
         }
     }
 

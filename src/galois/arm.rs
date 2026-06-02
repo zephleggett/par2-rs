@@ -155,7 +155,6 @@ unsafe fn neon_mul_128(
 /// **Performance**: ~2-3x faster than table-based multiplication on ARM64.
 ///
 /// **Requirements**: ARM64 with NEON support (standard on all AArch64 CPUs).
-
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn pmull_low_asm(a: poly8x16_t, b: poly8x16_t) -> poly16x8_t {

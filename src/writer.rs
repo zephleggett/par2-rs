@@ -133,17 +133,13 @@ pub fn write_creator_packet(
     write_packet(writer, &packet_types::CREATOR, recovery_set_id, body)
 }
 
-/// Write a Main packet
-/// Body:
-/// - Block size (8 bytes, u64)
-/// - File count (4 bytes, u32)
-/// - File IDs array (16 bytes × file_count, sorted numerically)
-pub fn write_main_packet(
-    writer: &mut impl Write,
-    recovery_set_id: &FileHash,
-    block_size: u64,
-    file_ids: &[FileHash],
-) -> Result<()> {
+/// Build the canonical Main packet body (block size + count + sorted File IDs).
+///
+/// The File IDs are sorted with par2cmdline's ordering (the 16-byte ID treated as
+/// a LITTLE-ENDIAN value, i.e. byte 15 first). This is the order in which input
+/// blocks are numbered, so it must be used both here and for block numbering, and
+/// it is what `compute_recovery_set_id` hashes over.
+pub fn build_main_packet_body(block_size: u64, file_ids: &[FileHash]) -> Result<Vec<u8>> {
     let mut body = Vec::new();
 
     // Write block size
@@ -162,13 +158,28 @@ pub fn write_main_packet(
     })?;
     body.extend_from_slice(&file_count.to_le_bytes());
 
-    // Write sorted file IDs
+    // Write File IDs in canonical par2cmdline order.
     let mut sorted_ids = file_ids.to_vec();
-    sorted_ids.sort_unstable();
+    sorted_ids.sort_by(crate::parser::cmp_file_id_par2);
     for file_id in &sorted_ids {
         body.extend_from_slice(file_id);
     }
 
+    Ok(body)
+}
+
+/// Write a Main packet
+/// Body:
+/// - Block size (8 bytes, u64)
+/// - File count (4 bytes, u32)
+/// - File IDs array (16 bytes × file_count, sorted in par2cmdline order)
+pub fn write_main_packet(
+    writer: &mut impl Write,
+    recovery_set_id: &FileHash,
+    block_size: u64,
+    file_ids: &[FileHash],
+) -> Result<()> {
+    let body = build_main_packet_body(block_size, file_ids)?;
     write_packet(writer, &packet_types::MAIN, recovery_set_id, &body)
 }
 

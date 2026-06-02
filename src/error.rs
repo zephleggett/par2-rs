@@ -31,6 +31,9 @@ pub enum Par2Error {
     #[error("Hash mismatch for file {0}")]
     HashMismatch(String),
 
+    #[error("PAR2 operation cancelled")]
+    Cancelled,
+
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 }

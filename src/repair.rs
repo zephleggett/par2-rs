@@ -33,7 +33,7 @@ use std::io::{Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 // Thread-local file handle cache for Windows
@@ -47,6 +47,67 @@ use std::sync::Once;
 
 static RAYON_INIT: Once = Once::new();
 const MAX_BLOCKS: usize = 65_535;
+
+/// Suffix used for sibling temp files during repair. Reconstruction writes here
+/// first; only after the full result is computed and verified do we atomically
+/// rename temp -> final, so a cancellation or crash never corrupts originals.
+const TMP_SUFFIX: &str = ".par2tmp";
+
+/// Returns `true` if a cancellation flag is set.
+#[inline]
+fn is_cancelled(cancel: Option<&AtomicBool>) -> bool {
+    cancel.map(|c| c.load(Ordering::Relaxed)).unwrap_or(false)
+}
+
+/// Build the sibling temp path for a final output path: `<final>.par2tmp`.
+fn temp_path_for(final_path: &Path) -> PathBuf {
+    let mut s = final_path.as_os_str().to_os_string();
+    s.push(TMP_SUFFIX);
+    PathBuf::from(s)
+}
+
+/// Best-effort cleanup: remove any temp files left behind on abort/error.
+fn cleanup_temp_files(temp_paths: &[PathBuf]) {
+    for p in temp_paths {
+        if let Err(e) = std::fs::remove_file(p) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(path = %p.display(), error = %e, "Failed to remove temp file");
+            }
+        }
+    }
+}
+
+/// Copy up to `target_len` bytes of `original_path` into `tmp_file` starting at
+/// offset 0. This seeds a damaged-file temp with its surviving (good) blocks;
+/// reconstruction later overwrites only the damaged block ranges. The temp file
+/// must already be sized to the final target length (so any region beyond the
+/// original's length stays zero-filled).
+fn copy_original_into_temp(
+    original_path: &Path,
+    tmp_file: &mut File,
+    target_len: u64,
+) -> Result<()> {
+    use std::io::{BufReader, Read};
+
+    let original = File::open(original_path)?;
+    let original_len = original.metadata()?.len();
+    let to_copy = original_len.min(target_len);
+
+    tmp_file.seek(SeekFrom::Start(0))?;
+    let mut reader = BufReader::with_capacity(1024 * 1024, original);
+    let mut buffer = vec![0u8; 1024 * 1024];
+    let mut copied = 0u64;
+    while copied < to_copy {
+        let want = ((to_copy - copied) as usize).min(buffer.len());
+        let read_now = reader.read(&mut buffer[..want])?;
+        if read_now == 0 {
+            break;
+        }
+        tmp_file.write_all(&buffer[..read_now])?;
+        copied += read_now as u64;
+    }
+    Ok(())
+}
 
 /// Initialize rayon thread pool with container-aware CPU count
 fn init_rayon_pool() {
@@ -393,16 +454,28 @@ pub fn repair_files_parallel(
         base_path,
         progress_callback,
         None,
+        None,
     )
 }
 
 /// Parallel repair with message callback
+///
+/// # Cancellation and temp-file safety
+///
+/// Reconstructed data is written to sibling `<final>.par2tmp` files; the real
+/// output files are never mutated until the full reconstruction has been
+/// computed. If `cancel` is set (or any error occurs) before the final rename
+/// step, all temp files are deleted and every original byte is left untouched,
+/// returning [`Par2Error::Cancelled`]. On success, each temp file is atomically
+/// renamed over its final path.
+#[allow(clippy::too_many_arguments)]
 pub fn repair_files_with_messages(
     par2_data: &Par2File,
     verification_result: &VerificationResult,
     base_path: &Path,
     progress_callback: Option<ProgressCallback>,
     message_callback: Option<MessageCallback>,
+    cancel: Option<&AtomicBool>,
 ) -> Result<()> {
     if par2_data.block_size == 0 {
         return Err(Par2Error::InvalidFormat(
@@ -660,57 +733,86 @@ pub fn repair_files_with_messages(
         }
     }
 
-    // Open file handles once for writing (reduce file open/close overhead)
+    // TEMP-FILE SAFETY: we never mutate the real output files during repair.
+    // Reconstructed data is written into sibling `<final>.par2tmp` files. The
+    // originals are only read (good blocks) during reconstruction, and are only
+    // replaced via an atomic rename AFTER the whole reconstruction succeeds.
+    //
+    // `output_files`  -> write handles on the TEMP files (keyed by file_id)
+    // `input_files`   -> read-only handles on the ORIGINAL files (for good blocks)
+    // `temp_to_final` -> (temp_path, final_path) pairs for rename/cleanup
     let mut output_files: HashMap<FileHash, File> = HashMap::new();
-    // Open file handles once for reading (avoid per-read open/seek/close)
     let mut input_files: HashMap<FileHash, File> = HashMap::new();
+    let mut temp_to_final: HashMap<FileHash, (PathBuf, PathBuf)> = HashMap::new();
 
-    // Missing files: create new, truncate is OK since file doesn't exist
-    for file_id in &verification_result.missing_files {
-        if let Some(file_info) = file_map.get(file_id) {
-            let file_path = base_path.join(&file_info.name);
+    // Helper to create a temp output file with a given length, with cleanup on error.
+    // Returns a read+write handle positioned anywhere (callers seek/write_at).
+    let open_temp =
+        |final_path: &Path, length: u64, created: &mut Vec<PathBuf>| -> Result<(PathBuf, File)> {
+            let tmp = temp_path_for(final_path);
             let file = OpenOptions::new()
                 .read(true)
                 .write(true)
                 .create(true)
                 .truncate(true)
-                .open(&file_path)?;
+                .open(&tmp)?;
+            file.set_len(length)?;
+            created.push(tmp.clone());
+            Ok((tmp, file))
+        };
 
-            // Pre-allocate file size to ensure proper file growth
-            // This prevents issues with sparse files and ensures the file has the correct size
-            file.set_len(file_info.length)?;
+    // Track every temp file we create so we can clean up on any failure.
+    let mut created_temps: Vec<PathBuf> = Vec::new();
 
-            output_files.insert(*file_id, file);
-            // Also open a read-only handle for efficient read_at during reconstruction
-            // (separate handle avoids cursor contention with writer)
-            #[cfg(unix)]
-            {
-                let ro = OpenOptions::new().read(true).open(&file_path)?;
-                input_files.insert(*file_id, ro);
+    // Wrap setup so we can clean up temp files on any early error.
+    let setup_result: Result<()> = (|| {
+        // Missing files: create a fresh temp of the target length (no original to copy).
+        for file_id in &verification_result.missing_files {
+            if let Some(file_info) = file_map.get(file_id) {
+                let final_path = base_path.join(&file_info.name);
+                let (tmp, file) = open_temp(&final_path, file_info.length, &mut created_temps)?;
+                output_files.insert(*file_id, file);
+                temp_to_final.insert(*file_id, (tmp, final_path));
+                // No input handle: a missing file has no surviving blocks to read.
             }
         }
-    }
 
-    // Damaged files: DON'T truncate! We need to read good blocks first
-    for file_id in &verification_result.damaged_files {
-        if let Some(file_info) = file_map.get(file_id) {
-            let file_path = base_path.join(&file_info.name);
-            let file = OpenOptions::new().read(true).write(true).open(&file_path)?;
-            let actual_len = file.metadata()?.len();
-            if actual_len != file_info.length {
-                file.set_len(file_info.length)?;
-            }
-            output_files.insert(*file_id, file);
-            // Open separate read-only handle to enable read_at in parallel
-            #[cfg(unix)]
-            {
-                let ro = OpenOptions::new().read(true).open(&file_path)?;
-                input_files.insert(*file_id, ro);
+        // Damaged files: copy ALL surviving bytes from the original into the temp,
+        // then reconstruction overwrites just the damaged block ranges. We read
+        // good blocks from a read-only handle on the ORIGINAL (left untouched).
+        for file_id in &verification_result.damaged_files {
+            if let Some(file_info) = file_map.get(file_id) {
+                let final_path = base_path.join(&file_info.name);
+
+                // Read-only handle on the original for good-block reads during reconstruction.
+                let original_ro = OpenOptions::new().read(true).open(&final_path)?;
+
+                // Create the temp and seed it with the original's contents.
+                let (tmp, mut tmp_file) =
+                    open_temp(&final_path, file_info.length, &mut created_temps)?;
+                copy_original_into_temp(&final_path, &mut tmp_file, file_info.length)?;
+
+                output_files.insert(*file_id, tmp_file);
+                input_files.insert(*file_id, original_ro);
+                temp_to_final.insert(*file_id, (tmp, final_path));
             }
         }
+        Ok(())
+    })();
+
+    if let Err(e) = setup_result {
+        cleanup_temp_files(&created_temps);
+        return Err(e);
     }
 
-    // For verified (good) files, open read-only handles
+    // Abort early (after setup) if cancellation was requested. No originals
+    // touched yet, only temp files exist -> safe to delete and bail.
+    if is_cancelled(cancel) {
+        cleanup_temp_files(&created_temps);
+        return Err(Par2Error::Cancelled);
+    }
+
+    // For verified (good) files, open read-only handles on the ORIGINALS.
     for (file_id, path) in &file_paths {
         if !input_files.contains_key(file_id) {
             if let Ok(ro) = OpenOptions::new().read(true).open(path) {
@@ -729,25 +831,40 @@ pub fn repair_files_with_messages(
         "Parallel repair configuration"
     );
 
-    // Prepare indices for streaming API
-    let mut present_recovery_indices: Vec<usize> = Vec::with_capacity(recovery_blocks.len());
-    for i in 0..recovery_blocks.len() {
-        let idx = total_blocks
-            .checked_add(i)
-            .ok_or_else(|| Par2Error::InvalidFormat("Recovery index overflow".to_string()))?;
-        present_recovery_indices.push(idx);
-    }
+    // Prepare indices for streaming API and compute the Gaussian-elimination
+    // transformation ONCE for all chunks. Wrapped so any failure here (after
+    // temp files were created) cleans them up and leaves originals untouched.
+    let prep_result: Result<(Vec<usize>, crate::par2_rs::ReconstructionTransform)> = (|| {
+        let mut present_recovery_indices: Vec<usize> = Vec::with_capacity(recovery_blocks.len());
+        for i in 0..recovery_blocks.len() {
+            let idx = total_blocks
+                .checked_add(i)
+                .ok_or_else(|| Par2Error::InvalidFormat("Recovery index overflow".to_string()))?;
+            present_recovery_indices.push(idx);
+        }
 
-    // CRITICAL: Compute Gaussian elimination transformation ONCE for all chunks
-    // This is the key optimization - avoid O(m³) work per chunk!
-    let transform = rs
-        .compute_reconstruction_transform(
-            &damaged_block_indices,
-            &good_indices,
-            &present_recovery_indices,
-            &recovery_exponents,
-        )
-        .map_err(|e| Par2Error::RepairFailed(format!("Failed to compute transformation: {}", e)))?;
+        // CRITICAL: Compute Gaussian elimination transformation ONCE for all chunks
+        // This is the key optimization - avoid O(m³) work per chunk!
+        let transform = rs
+            .compute_reconstruction_transform(
+                &damaged_block_indices,
+                &good_indices,
+                &present_recovery_indices,
+                &recovery_exponents,
+            )
+            .map_err(|e| {
+                Par2Error::RepairFailed(format!("Failed to compute transformation: {}", e))
+            })?;
+        Ok((present_recovery_indices, transform))
+    })();
+
+    let (present_recovery_indices, transform) = match prep_result {
+        Ok(v) => v,
+        Err(e) => {
+            cleanup_temp_files(&created_temps);
+            return Err(e);
+        }
+    };
 
     tracing::info!(
         "Gaussian elimination computed once (will be reused for all {} chunks)",
@@ -784,6 +901,9 @@ pub fn repair_files_with_messages(
 
     let chunks_done = Arc::new(AtomicU64::new(0));
     let progress_callback = progress_callback.clone();
+    // Shared flag set when any worker observes cancellation, so the main thread
+    // can detect it after the scope (the compute phase only touches temp files).
+    let observed_cancel = Arc::new(AtomicBool::new(false));
     rayon::scope(|s| {
         for thread_id in 0..num_threads {
             let start = thread_id * chunks_per_thread;
@@ -807,10 +927,17 @@ pub fn repair_files_with_messages(
             let results_wrapper = &results_wrapper;
             let progress_callback = progress_callback.clone();
             let chunks_done = Arc::clone(&chunks_done);
+            let observed_cancel = Arc::clone(&observed_cancel);
 
             // Each thread gets exactly one task - processes contiguous range of chunks
             s.spawn(move |_| {
                 for chunk_idx in start..end {
+                    // Cancellation only aborts the (temp-file-only) compute phase.
+                    // Originals are never written here, so breaking out is safe.
+                    if is_cancelled(cancel) || observed_cancel.load(Ordering::Relaxed) {
+                        observed_cancel.store(true, Ordering::Relaxed);
+                        break;
+                    }
                     let result = process_chunk(
                         chunk_idx,
                         chunk_size,
@@ -842,60 +969,159 @@ pub fn repair_files_with_messages(
         }
     }); // Single sync point here - all processing complete
 
+    // If cancellation was observed during the compute phase, abort now. Only
+    // temp files exist; the originals are byte-identical to before this call.
+    if observed_cancel.load(Ordering::Relaxed) || is_cancelled(cancel) {
+        cleanup_temp_files(&created_temps);
+        return Err(Par2Error::Cancelled);
+    }
+
     // Write all results sequentially (I/O is not the bottleneck)
-    let mut total_writes = 0;
-    for (chunk_idx, result_cell) in results.iter().enumerate() {
-        let chunk_result = unsafe { (*result_cell.get()).take() }.ok_or_else(|| {
-            Par2Error::RepairFailed(format!("Chunk {} was not processed", chunk_idx))
-        })?;
+    //
+    // All writes below target the TEMP files only. Wrap them so that ANY error
+    // cleans up the temp files and leaves the originals untouched.
+    let write_phase: Result<()> = (|| {
+        let mut total_writes = 0;
+        for (chunk_idx, result_cell) in results.iter().enumerate() {
+            let chunk_result = unsafe { (*result_cell.get()).take() }.ok_or_else(|| {
+                Par2Error::RepairFailed(format!("Chunk {} was not processed", chunk_idx))
+            })?;
 
-        for (block_idx, chunk_offset, data) in chunk_result? {
-            if let Some(&(file_id, block_in_file)) = block_to_file.get(&block_idx) {
-                if let Some(file) = output_files.get_mut(&file_id) {
-                    if let Some(file_info) = file_map.get(&file_id) {
-                        let block_byte_offset = (block_in_file as u64) * (block_size as u64);
-                        let write_offset = block_byte_offset + chunk_offset;
+            for (block_idx, chunk_offset, data) in chunk_result? {
+                if let Some(&(file_id, block_in_file)) = block_to_file.get(&block_idx) {
+                    if let Some(file) = output_files.get_mut(&file_id) {
+                        if let Some(file_info) = file_map.get(&file_id) {
+                            let block_byte_offset = (block_in_file as u64) * (block_size as u64);
+                            let write_offset = block_byte_offset + chunk_offset;
 
-                        file.seek(SeekFrom::Start(write_offset))?;
+                            file.seek(SeekFrom::Start(write_offset))?;
 
-                        let file_remaining = file_info.length.saturating_sub(write_offset);
-                        let bytes_to_write = (data.len() as u64).min(file_remaining) as usize;
+                            let file_remaining = file_info.length.saturating_sub(write_offset);
+                            let bytes_to_write = (data.len() as u64).min(file_remaining) as usize;
 
-                        if bytes_to_write > 0 {
-                            file.write_all(&data[..bytes_to_write])?;
-                            total_writes += 1;
+                            if bytes_to_write > 0 {
+                                file.write_all(&data[..bytes_to_write])?;
+                                total_writes += 1;
+                            }
                         }
                     }
                 }
             }
         }
-    }
 
-    tracing::debug!(total_writes, num_chunks, "All chunks written");
+        tracing::debug!(total_writes, num_chunks, "All chunks written to temp files");
 
-    // Verify chunks were written (note: total_writes may be less than theoretical max due to partial last blocks)
-    let theoretical_max_writes = num_chunks * damaged_block_indices.len();
-    tracing::info!(
-        total_writes,
-        theoretical_max = theoretical_max_writes,
-        num_chunks,
-        damaged_blocks = damaged_block_indices.len(),
-        "Chunk writes completed"
-    );
-
-    if total_writes < theoretical_max_writes {
-        tracing::debug!(
-            diff = theoretical_max_writes - total_writes,
-            "Some chunks were skipped (likely due to partial last blocks)"
+        // Verify chunks were written (note: total_writes may be less than theoretical max due to partial last blocks)
+        let theoretical_max_writes = num_chunks * damaged_block_indices.len();
+        tracing::info!(
+            total_writes,
+            theoretical_max = theoretical_max_writes,
+            num_chunks,
+            damaged_blocks = damaged_block_indices.len(),
+            "Chunk writes completed"
         );
+
+        if total_writes < theoretical_max_writes {
+            tracing::debug!(
+                diff = theoretical_max_writes - total_writes,
+                "Some chunks were skipped (likely due to partial last blocks)"
+            );
+        }
+
+        // Flush all temp files to disk before renaming.
+        for (_file_id, file) in output_files.iter_mut() {
+            file.flush()?;
+        }
+        Ok(())
+    })();
+
+    if let Err(e) = write_phase {
+        cleanup_temp_files(&created_temps);
+        return Err(e);
     }
 
-    // Flush all output files to disk
-    // sync_all (fsync) is disabled by default for performance
-    // OS will handle flushing to disk in the background
-    for (_file_id, file) in output_files.iter_mut() {
-        file.flush()?;
-        // Note: sync_all disabled by default - OS will flush to disk asynchronously
+    // Final, last-chance cancellation check. Still safe: only temp files exist.
+    if is_cancelled(cancel) {
+        cleanup_temp_files(&created_temps);
+        return Err(Par2Error::Cancelled);
+    }
+
+    // Drop write/read handles before verifying & renaming. Flushing happened in
+    // the write phase, but dropping the write handles guarantees the data is
+    // visible to fresh read handles and lets Windows rename the temp files.
+    drop(output_files);
+    drop(input_files);
+
+    // PRE-RENAME VERIFICATION (critical correctness gate).
+    //
+    // Verify every reconstructed TEMP file against the PAR2 checksums BEFORE any
+    // atomic rename. If reconstruction produced wrong bytes (as the historical
+    // FileID-ordering bug did), we must NOT clobber the user's data. On any temp
+    // file failing verification we delete all temps and return the standard
+    // "verification failed" error, leaving every original byte-identical.
+    let verify_phase: Result<()> = (|| {
+        for (file_id, (tmp, final_path)) in temp_to_final.iter() {
+            // Cancellation is still safe here: only temp files exist.
+            if is_cancelled(cancel) {
+                return Err(Par2Error::Cancelled);
+            }
+            let Some(file_info) = file_map.get(file_id) else {
+                continue;
+            };
+            let slice_checksums = par2_data.slice_checksums.get(file_id).map(|v| v.as_slice());
+            let ok = crate::verify::verify_reconstructed_file(
+                tmp,
+                file_info,
+                slice_checksums,
+                par2_data.block_size,
+            )?;
+            if !ok {
+                tracing::error!(
+                    tmp = %tmp.display(),
+                    final_path = %final_path.display(),
+                    "Reconstructed temp file failed verification; refusing to commit"
+                );
+                return Err(Par2Error::RepairFailed(
+                    "Repair completed but verification failed - files may still be damaged"
+                        .to_string(),
+                ));
+            }
+        }
+        Ok(())
+    })();
+
+    if let Err(e) = verify_phase {
+        cleanup_temp_files(&created_temps);
+        return Err(e);
+    }
+
+    // COMMIT: reconstruction fully computed and VERIFIED in temp files. Atomically
+    // rename each temp over its final path. From here on the originals are replaced
+    // one-by-one; this is the only point at which user data is modified, and only
+    // with data that has already passed checksum verification.
+
+    let mut commit_err: Option<Par2Error> = None;
+    let mut remaining_temps: Vec<PathBuf> = Vec::new();
+    for (_file_id, (tmp, final_path)) in temp_to_final.iter() {
+        if commit_err.is_some() {
+            remaining_temps.push(tmp.clone());
+            continue;
+        }
+        if let Err(e) = std::fs::rename(tmp, final_path) {
+            tracing::error!(
+                tmp = %tmp.display(),
+                final_path = %final_path.display(),
+                error = %e,
+                "Failed to rename temp file into place"
+            );
+            commit_err = Some(Par2Error::Io(e));
+            remaining_temps.push(tmp.clone());
+        }
+    }
+    if let Some(e) = commit_err {
+        // Best-effort: remove temp files that were not renamed.
+        cleanup_temp_files(&remaining_temps);
+        return Err(e);
     }
 
     tracing::info!(
