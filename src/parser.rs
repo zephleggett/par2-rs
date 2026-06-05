@@ -350,8 +350,15 @@ impl Par2File {
                 }
                 PacketType::FileDescription => {
                     if let Some(file_info) = parse_file_desc_from_body(&packet_body) {
-                        files.insert(file_info.file_id, file_info.clone());
-                        files_in_order.push(file_info);
+                        // FileDescription packets are repeated many times across a
+                        // par2 set (within a file and across volumes) for
+                        // redundancy. Record each file_id ONCE — otherwise
+                        // `files_in_order` is multiplied, and the block numbering
+                        // and GF(2^16) block-count derived from it blow up (a
+                        // 185-file set was being counted as 227k blocks).
+                        if files.insert(file_info.file_id, file_info.clone()).is_none() {
+                            files_in_order.push(file_info);
+                        }
                     }
                 }
                 PacketType::RecoverySlice => {
@@ -909,6 +916,37 @@ mod ordering_tests {
         reorder_files_canonically(&mut files, &main_order);
         let names: Vec<&str> = files.iter().map(|f| f.name.as_str()).collect();
         assert_eq!(names, vec!["b", "c", "a"], "must follow Main packet order");
+    }
+
+    #[test]
+    fn file_descriptions_deduplicated_when_loaded_from_volume() {
+        // Volume par2 files repeat FileDescription packets many times for
+        // redundancy (testdata.vol31+29.par2 carries 50 = 5x10). Loading from a
+        // volume — which happens with obfuscated Usenet names that lack the
+        // `.vol` marker, so the caller can't tell index from volume — must still
+        // yield exactly one entry per file. Otherwise `files_in_order` is
+        // multiplied and the derived block numbering / GF(2^16) block count blow
+        // up (a real 185-file set was being counted as 227k blocks > 65535).
+        let vol = Path::new("tests/data/testdata.vol31+29.par2");
+        if !vol.exists() {
+            eprintln!("bundled fixtures missing; skipping");
+            return;
+        }
+        let par2 = Par2File::load(vol, Path::new("tests/data"), None).unwrap();
+        assert_eq!(
+            par2.files_in_order.len(),
+            par2.files.len(),
+            "files_in_order must not contain duplicate FileDescription entries"
+        );
+        assert_eq!(par2.files_in_order.len(), 10, "testdata protects 10 files");
+        let mut ids: Vec<_> = par2.files_in_order.iter().map(|f| f.file_id).collect();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(
+            ids.len(),
+            par2.files_in_order.len(),
+            "no duplicate file_ids"
+        );
     }
 
     /// End-to-end invariant on the bundled real fixtures: after loading, each
